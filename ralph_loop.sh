@@ -15,6 +15,7 @@ source "$SCRIPT_DIR/lib/timeout_utils.sh" || { echo "FATAL: Failed to source lib
 source "$SCRIPT_DIR/lib/response_analyzer.sh" || { echo "FATAL: Failed to source lib/response_analyzer.sh" >&2; exit 1; }
 source "$SCRIPT_DIR/lib/circuit_breaker.sh" || { echo "FATAL: Failed to source lib/circuit_breaker.sh" >&2; exit 1; }
 source "$SCRIPT_DIR/lib/file_protection.sh" || { echo "FATAL: Failed to source lib/file_protection.sh" >&2; exit 1; }
+source "$SCRIPT_DIR/lib/hgmux_bridge.sh"
 
 # Configuration
 # Ralph-specific files live in .ralph/ subfolder
@@ -31,6 +32,7 @@ LIVE_LOG_FILE="$RALPH_DIR/live.log"  # Fixed file for live output monitoring
 CALL_COUNT_FILE="$RALPH_DIR/.call_count"
 TIMESTAMP_FILE="$RALPH_DIR/.last_reset"
 USE_TMUX=false
+USE_HGMUX=false
 
 # Save environment variable state BEFORE setting defaults
 # These are used by load_ralphrc() to determine which values came from environment
@@ -413,6 +415,11 @@ log_status() {
     # 2>/dev/null suppresses "Input/output error" when tmux pty is broken (Issue #188)
     echo -e "${color}[$timestamp] [$level] $message${NC}" >&2 2>/dev/null
     echo "[$timestamp] [$level] $message" >> "$LOG_DIR/ralph.log" 2>/dev/null
+
+    # Push to hgmux sidebar if available
+    if is_hgmux; then
+        hgmux_log "$level" "$message"
+    fi
 }
 
 # Update status JSON for external monitoring
@@ -435,6 +442,11 @@ update_status() {
     "next_reset": "$(get_next_hour_time)"
 }
 STATUSEOF
+
+    # Push status to hgmux sidebar
+    if is_hgmux; then
+        hgmux_update_loop_status "$loop_count" "$calls_made" "$MAX_CALLS_PER_HOUR" "$status"
+    fi
 }
 
 # Check if we can make another call
@@ -1739,6 +1751,8 @@ cleanup() {
         log_status "INFO" "Ralph loop interrupted. Cleaning up..."
         reset_session "manual_interrupt"
         update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped"
+        hgmux_report_status "ralph_status" "stopped" "stop"
+        hgmux_notify "Ralph: Interrupted" "Loop stopped at iteration #$loop_count"
     fi
     # No exit here — EXIT trap handles natural termination
 }
@@ -1771,6 +1785,13 @@ main() {
     log_status "SUCCESS" "🚀 Ralph loop starting with Claude Code"
     log_status "INFO" "Max calls per hour: $MAX_CALLS_PER_HOUR"
     log_status "INFO" "Logs: $LOG_DIR/ | Docs: $DOCS_DIR/ | Status: $STATUS_FILE"
+
+    # Push initial hgmux status
+    if is_hgmux; then
+        log_status "INFO" "hgmux detected - sidebar status enabled"
+        hgmux_report_status "ralph_status" "running" "play"
+        hgmux_report_status "ralph_max_calls" "$MAX_CALLS_PER_HOUR/hr" "gauge"
+    fi
 
     # Check if project uses old flat structure and needs migration
     if [[ -f "PROMPT.md" ]] && [[ ! -d ".ralph" ]]; then
@@ -1861,6 +1882,7 @@ main() {
             reset_session "circuit_breaker_open"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
             log_status "ERROR" "🛑 Circuit breaker has opened - execution halted"
+            hgmux_notify_circuit_breaker "OPEN" "stagnation_detected"
             break
         fi
 
@@ -1878,6 +1900,7 @@ main() {
                 log_status "ERROR" "🚫 Permission denied - halting loop"
                 reset_session "permission_denied"
                 update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "permission_denied" "halted" "permission_denied"
+                hgmux_notify_error "Permission denied - loop halted. Update ALLOWED_TOOLS in .ralphrc"
 
                 # Display helpful guidance for resolving permission issues
                 echo ""
@@ -1920,6 +1943,7 @@ main() {
             log_status "INFO" "  - Total loops: $loop_count"
             log_status "INFO" "  - API calls used: $(cat "$CALL_COUNT_FILE")"
             log_status "INFO" "  - Exit reason: $exit_reason"
+            hgmux_notify_completion "$exit_reason" "$loop_count" "$(cat "$CALL_COUNT_FILE")"
 
             break
         fi
@@ -1943,11 +1967,13 @@ main() {
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
             log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
             log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
+            hgmux_notify_circuit_breaker "OPEN" "stagnation_detected"
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused"
             log_status "WARN" "🛑 Claude API 5-hour limit reached!"
+            hgmux_notify "Ralph: API Limit" "5-hour usage limit reached. Waiting for reset..."
             
             # Ask user whether to wait or exit
             echo -e "\n${YELLOW}A Claude API usage limit has been reached (5-hour plan limit or Extra Usage quota).${NC}"
@@ -2009,6 +2035,7 @@ Options:
     -p, --prompt FILE       Set prompt file (default: $PROMPT_FILE)
     -s, --status            Show current status and exit
     -m, --monitor           Start with tmux session and live monitor (requires tmux)
+    --hgmux                 Force hgmux mode (auto-detected if CMUX_SOCKET_PATH is set)
     -v, --verbose           Show detailed progress updates during execution
     -l, --live              Show Claude Code output in real-time (auto-switches to JSON output)
     -t, --timeout MIN       Set Claude Code execution timeout in minutes (default: $CLAUDE_TIMEOUT_MINUTES)
@@ -2048,6 +2075,7 @@ Examples:
     $0 --output-format text     # Use legacy text output format
     $0 --no-continue            # Disable session continuity
     $0 --session-expiry 48      # 48-hour session expiration
+    $0 --hgmux                  # Force hgmux mode (auto-detected in hgmux terminal)
 
 HELPEOF
 }
@@ -2153,6 +2181,10 @@ while [[ $# -gt 0 ]]; do
             CB_AUTO_RESET=true
             shift
             ;;
+        --hgmux)
+            USE_HGMUX=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             show_help
@@ -2163,7 +2195,21 @@ done
 
 # Only execute when run directly, not when sourced
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # If tmux mode requested, set it up
+    # Auto-detect hgmux if not explicitly set
+    if [[ "$USE_HGMUX" == "false" ]] && is_hgmux; then
+        USE_HGMUX=true
+    fi
+
+    # If hgmux mode, set up workspace (when --monitor is used)
+    if [[ "$USE_HGMUX" == "true" ]] && [[ "$USE_TMUX" == "true" ]]; then
+        # hgmux replaces tmux - create workspace with split pane layout
+        USE_TMUX=false
+        hgmux_setup_session "$(pwd)"
+        # In hgmux mode, --monitor just means "use live mode" (no tmux needed)
+        LIVE_OUTPUT=true
+    fi
+
+    # If tmux mode requested (and not overridden by hgmux), set it up
     if [[ "$USE_TMUX" == "true" ]]; then
         check_tmux_available
         setup_tmux_session
