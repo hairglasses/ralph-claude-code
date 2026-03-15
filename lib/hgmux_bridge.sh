@@ -48,9 +48,9 @@ hgmux_report_status() {
     fi
 
     if [[ -n "$icon" ]]; then
-        cmux set-status "$key" "$value" --icon "$icon" 2>/dev/null || true
+        cmux set-status "$key" "$value" --icon "$icon" >/dev/null 2>/dev/null || true
     else
-        cmux set-status "$key" "$value" 2>/dev/null || true
+        cmux set-status "$key" "$value" >/dev/null 2>/dev/null || true
     fi
 }
 
@@ -68,9 +68,9 @@ hgmux_set_progress() {
     fi
 
     if [[ -n "$label" ]]; then
-        cmux set-progress "$fraction" --label "$label" 2>/dev/null || true
+        cmux set-progress "$fraction" --label "$label" >/dev/null 2>/dev/null || true
     else
-        cmux set-progress "$fraction" 2>/dev/null || true
+        cmux set-progress "$fraction" >/dev/null 2>/dev/null || true
     fi
 }
 
@@ -87,7 +87,7 @@ hgmux_notify() {
         return 0
     fi
 
-    cmux notify --title "$title" --body "$body" 2>/dev/null || true
+    cmux notify --title "$title" --body "$body" >/dev/null 2>/dev/null || true
 }
 
 # hgmux_log - Write a log entry to sidebar (via report_meta logEntries)
@@ -135,6 +135,7 @@ hgmux_setup_session() {
     # Create a new workspace for ralph
     local create_output
     create_output=$(cmux new-workspace --cwd "$project_dir" 2>/dev/null) || true
+    # Note: create_output intentionally captures stdout for workspace ref
 
     # Extract workspace ref if returned (format: "OK workspace:N")
     if [[ -n "$create_output" ]]; then
@@ -143,16 +144,16 @@ hgmux_setup_session() {
 
     # Rename the workspace
     if [[ -n "$_HGMUX_WORKSPACE_REF" ]]; then
-        cmux rename-workspace --workspace "$_HGMUX_WORKSPACE_REF" "Ralph: $project_name" 2>/dev/null || true
+        cmux rename-workspace --workspace "$_HGMUX_WORKSPACE_REF" "Ralph: $project_name" >/dev/null 2>/dev/null || true
     fi
 
     # Split pane for live log viewing
-    cmux new-split right 2>/dev/null || true
+    cmux new-split right >/dev/null 2>/dev/null || true
 
     # Start tailing the log in the right pane
     local live_log="$project_dir/.ralph/live.log"
     if [[ -f "$live_log" ]]; then
-        cmux send "tail -f '$live_log'\\n" 2>/dev/null || true
+        cmux send "tail -f '$live_log'\\n" >/dev/null 2>/dev/null || true
     fi
 
     # Push initial status

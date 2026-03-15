@@ -16,6 +16,9 @@ source "$SCRIPT_DIR/lib/response_analyzer.sh" || { echo "FATAL: Failed to source
 source "$SCRIPT_DIR/lib/circuit_breaker.sh" || { echo "FATAL: Failed to source lib/circuit_breaker.sh" >&2; exit 1; }
 source "$SCRIPT_DIR/lib/file_protection.sh" || { echo "FATAL: Failed to source lib/file_protection.sh" >&2; exit 1; }
 source "$SCRIPT_DIR/lib/hgmux_bridge.sh"
+source "$SCRIPT_DIR/lib/cost_governor.sh"
+source "$SCRIPT_DIR/lib/model_selector.sh"
+source "$SCRIPT_DIR/lib/improvement_journal.sh"
 
 # Configuration
 # Ralph-specific files live in .ralph/ subfolder
@@ -69,6 +72,15 @@ RALPH_SESSION_HISTORY_FILE="$RALPH_DIR/.ralph_session_history"  # Session transi
 # Session expiration: 24 hours default balances project continuity with fresh context
 # Too short = frequent context loss; Too long = stale context causes unpredictable behavior
 CLAUDE_SESSION_EXPIRY_HOURS=${CLAUDE_SESSION_EXPIRY_HOURS:-24}
+
+# Cost governor and model selection defaults
+RALPH_USAGE_MODE="${RALPH_USAGE_MODE:-api}"
+RALPH_SESSION_BUDGET="${RALPH_SESSION_BUDGET:-50}"
+RALPH_BUDGET_DOWNGRADE_PCT="${RALPH_BUDGET_DOWNGRADE_PCT:-60}"
+RALPH_MAX_OPUS_CALLS_PER_WINDOW="${RALPH_MAX_OPUS_CALLS_PER_WINDOW:-30}"
+RALPH_OPUS_WINDOW_HOURS="${RALPH_OPUS_WINDOW_HOURS:-5}"
+RALPH_COST_ALARM_PER_LOOP="${RALPH_COST_ALARM_PER_LOOP:-5}"
+RALPH_META_IMPROVEMENT_INTERVAL="${RALPH_META_IMPROVEMENT_INTERVAL:-10}"
 
 # Valid tool patterns for --allowed-tools validation
 # Tools can be exact matches or pattern matches with wildcards in parentheses
@@ -430,6 +442,11 @@ update_status() {
     local status=$4
     local exit_reason=${5:-""}
     
+    local _current_model _session_spend _budget_status
+    _current_model=$(get_current_model 2>/dev/null || echo "unknown")
+    _session_spend=$(get_session_spend 2>/dev/null || echo "0")
+    _budget_status=$(check_budget 2>/dev/null || echo "unknown")
+
     cat > "$STATUS_FILE" << STATUSEOF
 {
     "timestamp": "$(get_iso_timestamp)",
@@ -439,7 +456,10 @@ update_status() {
     "last_action": "$last_action",
     "status": "$status",
     "exit_reason": "$exit_reason",
-    "next_reset": "$(get_next_hour_time)"
+    "next_reset": "$(get_next_hour_time)",
+    "model": "$_current_model",
+    "session_spend_usd": $_session_spend,
+    "budget_status": "$_budget_status"
 }
 STATUSEOF
 
@@ -765,6 +785,13 @@ build_loop_context() {
             context+="Circuit breaker: ${cb_state}. "
         fi
     fi
+
+    # Add cost/model context
+    local _ctx_model _ctx_spend _ctx_budget
+    _ctx_model=$(get_current_model 2>/dev/null || echo "unknown")
+    _ctx_spend=$(get_session_spend 2>/dev/null || echo "0")
+    _ctx_budget=${RALPH_SESSION_BUDGET:-50}
+    context+="Model: ${_ctx_model}. Budget: \$${_ctx_spend}/\$${_ctx_budget}. "
 
     # Add previous loop summary (truncated)
     if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
@@ -1116,12 +1143,18 @@ build_claude_command() {
     local prompt_file=$1
     local loop_context=$2
     local session_id=$3
+    local model=${4:-""}
 
     # Reset global array
     # Note: We do NOT use --dangerously-skip-permissions here. Tool permissions
     # are controlled via --allowedTools from CLAUDE_ALLOWED_TOOLS in .ralphrc.
     # This preserves the permission denial circuit breaker (Issue #101).
     CLAUDE_CMD_ARGS=("$CLAUDE_CODE_CMD")
+
+    # Add model selection if specified
+    if [[ -n "$model" ]]; then
+        CLAUDE_CMD_ARGS+=("--model" "$model")
+    fi
 
     # Check if prompt file exists
     if [[ ! -f "$prompt_file" ]]; then
@@ -1191,6 +1224,35 @@ execute_claude_code() {
 
     log_status "LOOP" "Executing Claude Code (Call $calls_made/$MAX_CALLS_PER_HOUR)"
     local timeout_seconds=$((CLAUDE_TIMEOUT_MINUTES * 60))
+
+    # --- Cost Governor: Pre-execution checks ---
+    init_cost_tracking
+
+    # Check unproductive streak
+    if ! check_unproductive_streak; then
+        log_status "ERROR" "Unproductive streak detected — halting to prevent waste"
+        return 4
+    fi
+
+    # Check cost velocity
+    if ! check_cost_velocity; then
+        log_status "ERROR" "Cost velocity alarm — halting to prevent waste"
+        return 4
+    fi
+
+    # --- Model Selection ---
+    local selected_model
+    selected_model=$(select_model "$loop_count")
+    local model_exit=$?
+    if [[ $model_exit -eq 4 ]]; then
+        log_status "ERROR" "Budget exceeded — halting loop"
+        return 4
+    fi
+    log_status "INFO" "Model: $selected_model | Budget: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+
+    local loop_start_time
+    loop_start_time=$(date +%s)
+
     log_status "INFO" "⏳ Starting Claude Code execution... (timeout: ${CLAUDE_TIMEOUT_MINUTES}m)"
 
     # Build loop context (always, regardless of session mode)
@@ -1212,10 +1274,10 @@ execute_claude_code() {
         CLAUDE_OUTPUT_FORMAT="json"
     fi
 
-    # Build the Claude CLI command with modern flags
+    # Build the Claude CLI command with modern flags (including model)
     local use_modern_cli=false
 
-    if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id"; then
+    if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id" "$selected_model"; then
         use_modern_cli=true
         log_status "INFO" "Using modern CLI mode (${CLAUDE_OUTPUT_FORMAT} output)"
     else
@@ -1622,6 +1684,42 @@ EOF
             return 3  # Special code for circuit breaker trip
         fi
 
+        # --- Cost Recording ---
+        local loop_end_time loop_duration_s
+        loop_end_time=$(date +%s)
+        loop_duration_s=$((loop_end_time - loop_start_time))
+
+        # Determine productivity from response analysis
+        local tasks_done=0
+        local is_productive="false"
+        if [[ -f "$RALPH_DIR/.response_analysis" ]]; then
+            tasks_done=$(jq -r '.analysis.tasks_completed // 0' "$RALPH_DIR/.response_analysis" 2>/dev/null || echo "0")
+            tasks_done=$((tasks_done + 0))
+        fi
+        if [[ $tasks_done -gt 0 || $files_changed -gt 0 ]]; then
+            is_productive="true"
+        fi
+
+        record_loop_cost "$selected_model" "$loop_duration_s" "$is_productive" "$tasks_done"
+        log_status "INFO" "Cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+
+        # --- Improvement Journal ---
+        local current_phase
+        current_phase=$(grep 'CURRENT_PHASE=' .ralphrc 2>/dev/null | head -1 | sed 's/.*CURRENT_PHASE=//;s/"//g;s/#.*//' | tr -d '[:space:]')
+        current_phase=${current_phase:-unknown}
+        record_improvement_note "$loop_count" "$current_phase" "$selected_model" "$tasks_done" "$loop_duration_s" \
+            "$(estimate_cost "$selected_model" "$loop_duration_s")" "$is_productive" "$files_changed" "$output_file"
+
+        # Increment successful loop count and check for meta-improvement
+        if [[ "$is_productive" == "true" ]]; then
+            local success_count
+            success_count=$(increment_successful_loops)
+            if should_run_meta_improvement; then
+                log_status "INFO" "Triggering meta-improvement cycle (after $success_count successful loops)..."
+                run_meta_improvement
+            fi
+        fi
+
         return 0
     else
         # Clear progress file on failure
@@ -1953,8 +2051,8 @@ main() {
         update_status "$loop_count" "$calls_made" "executing" "running"
         
         # Execute Claude Code
-        execute_claude_code "$loop_count"
-        local exec_result=$?
+        local exec_result=0
+        execute_claude_code "$loop_count" || exec_result=$?
         
         if [ $exec_result -eq 0 ]; then
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
@@ -1968,6 +2066,14 @@ main() {
             log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
             log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
             hgmux_notify_circuit_breaker "OPEN" "stagnation_detected"
+            break
+        elif [ $exec_result -eq 4 ]; then
+            # Budget exceeded or cost safety triggered
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "budget_exceeded" "halted" "cost_limit"
+            log_status "ERROR" "Budget or cost safety limit reached — loop halted"
+            log_status "INFO" "Session spend: \$$(get_session_spend) / \$$RALPH_SESSION_BUDGET"
+            show_cost_status
+            hgmux_notify "Ralph: Budget Limit" "Cost safety triggered. Review with --cost-status"
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
@@ -2184,6 +2290,28 @@ while [[ $# -gt 0 ]]; do
         --hgmux)
             USE_HGMUX=true
             shift
+            ;;
+        --mode)
+            if [[ "$2" == "max" || "$2" == "api" ]]; then
+                RALPH_USAGE_MODE="$2"
+            else
+                echo "Error: --mode must be 'max' or 'api'"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --budget)
+            if [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "Error: --budget requires a positive integer (USD)"
+                exit 1
+            fi
+            RALPH_SESSION_BUDGET="$2"
+            shift 2
+            ;;
+        --cost-status)
+            init_cost_tracking
+            show_cost_status
+            exit 0
             ;;
         *)
             echo "Unknown option: $1"
