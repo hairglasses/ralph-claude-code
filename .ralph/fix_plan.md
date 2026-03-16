@@ -7,7 +7,7 @@
 
 ## Medium Priority
 - [x] Add retry backoff for transient errors (currently flat 30s sleep on failure)
-- [ ] Add a summary report on graceful exit showing total loops, estimated cost, files changed, and duration
+- [x] Add a summary report on graceful exit showing total loops, estimated cost, files changed, and duration
 - [ ] Improve circuit breaker: track output token trends across loops for cost estimation
 
 ## Low Priority

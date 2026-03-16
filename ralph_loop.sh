@@ -695,6 +695,59 @@ calculate_backoff_delay() {
     echo "$delay"
 }
 
+# Generate exit summary report showing run statistics
+# Arguments:
+#   $1 - total loop count
+#   $2 - exit reason (e.g., "project_complete", "budget_limit", "circuit_breaker_open")
+# Outputs a formatted summary to stdout and logs
+generate_exit_summary() {
+    local loop_count=${1:-0}
+    local exit_reason=${2:-"unknown"}
+    local total_cost
+    total_cost=$(get_total_cost)
+    local elapsed
+    elapsed=$(get_elapsed_runtime)
+    local api_calls
+    api_calls=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
+
+    # Count total files changed since run start
+    local files_changed=0
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        local run_start_sha=""
+        if [[ -f "$RALPH_DIR/.run_start_sha" ]]; then
+            run_start_sha=$(cat "$RALPH_DIR/.run_start_sha" 2>/dev/null || echo "")
+        fi
+        if [[ -n "$run_start_sha" ]]; then
+            local current_sha
+            current_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+            if [[ -n "$current_sha" && "$run_start_sha" != "$current_sha" ]]; then
+                files_changed=$(git diff --name-only "$run_start_sha" "$current_sha" 2>/dev/null | wc -l | tr -d ' ')
+            fi
+        fi
+    fi
+
+    echo ""
+    echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║              Ralph Run Summary                            ║${NC}"
+    echo -e "${GREEN}╠════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}║${NC}  Exit reason:     ${YELLOW}${exit_reason}${NC}"
+    echo -e "${GREEN}║${NC}  Total loops:     ${BLUE}${loop_count}${NC}"
+    echo -e "${GREEN}║${NC}  API calls:       ${BLUE}${api_calls}${NC}"
+    echo -e "${GREEN}║${NC}  Estimated cost:  ${BLUE}\$${total_cost}${NC}"
+    echo -e "${GREEN}║${NC}  Runtime:         ${BLUE}${elapsed}${NC}"
+    echo -e "${GREEN}║${NC}  Files changed:   ${BLUE}${files_changed}${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    log_status "SUCCESS" "=== Ralph Run Summary ==="
+    log_status "INFO" "  Exit reason:    $exit_reason"
+    log_status "INFO" "  Total loops:    $loop_count"
+    log_status "INFO" "  API calls:      $api_calls"
+    log_status "INFO" "  Estimated cost: \$$total_cost"
+    log_status "INFO" "  Runtime:        $elapsed"
+    log_status "INFO" "  Files changed:  $files_changed"
+}
+
 # Check if we should gracefully exit
 should_exit_gracefully() {
     
@@ -1770,6 +1823,11 @@ main() {
     # Initialize start time for --max-hours tracking
     init_start_time
 
+    # Capture starting git SHA for summary report (total files changed)
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        echo "$(git rev-parse HEAD 2>/dev/null || echo "")" > "$RALPH_DIR/.run_start_sha"
+    fi
+
     # Check if project uses old flat structure and needs migration
     if [[ -f "PROMPT.md" ]] && [[ ! -d ".ralph" ]]; then
         log_status "ERROR" "This project uses the old flat structure."
@@ -1844,6 +1902,7 @@ main() {
             echo ""
             reset_session "integrity_failure"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "integrity_failure" "halted" "files_deleted"
+            generate_exit_summary "$loop_count" "integrity_failure"
             break
         fi
 
@@ -1852,6 +1911,7 @@ main() {
             reset_session "circuit_breaker_open"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
             log_status "ERROR" "🛑 Circuit breaker has opened - execution halted"
+            generate_exit_summary "$loop_count" "circuit_breaker_open"
             break
         fi
 
@@ -1867,9 +1927,7 @@ main() {
             total_cost=$(get_total_cost)
             log_status "WARN" "💰 Budget limit reached: \$$total_cost / \$$MAX_COST"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "budget_exceeded" "halted" "budget_limit"
-            log_status "SUCCESS" "🏁 Ralph halted - budget limit of \$$MAX_COST exceeded (spent: \$$total_cost)"
-            log_status "INFO" "  - Total loops: $loop_count"
-            log_status "INFO" "  - Runtime: $(get_elapsed_runtime)"
+            generate_exit_summary "$loop_count" "budget_limit"
             break
         fi
 
@@ -1879,9 +1937,7 @@ main() {
             elapsed=$(get_elapsed_runtime)
             log_status "WARN" "⏰ Runtime limit reached: $elapsed / ${MAX_HOURS}h"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "runtime_exceeded" "halted" "runtime_limit"
-            log_status "SUCCESS" "🏁 Ralph halted - runtime limit of ${MAX_HOURS} hours exceeded ($elapsed)"
-            log_status "INFO" "  - Total loops: $loop_count"
-            log_status "INFO" "  - Estimated cost: \$$(get_total_cost)"
+            generate_exit_summary "$loop_count" "runtime_limit"
             break
         fi
 
@@ -1924,6 +1980,7 @@ main() {
                     fi
                 fi
 
+                generate_exit_summary "$loop_count" "permission_denied"
                 break
             fi
 
@@ -1931,12 +1988,7 @@ main() {
             reset_session "project_complete"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "graceful_exit" "completed" "$exit_reason"
 
-            log_status "SUCCESS" "🎉 Ralph has completed the project! Final stats:"
-            log_status "INFO" "  - Total loops: $loop_count"
-            log_status "INFO" "  - API calls used: $(cat "$CALL_COUNT_FILE")"
-            log_status "INFO" "  - Estimated cost: \$$(get_total_cost)"
-            log_status "INFO" "  - Runtime: $(get_elapsed_runtime)"
-            log_status "INFO" "  - Exit reason: $exit_reason"
+            generate_exit_summary "$loop_count" "$exit_reason"
 
             break
         fi
@@ -1963,6 +2015,7 @@ main() {
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
             log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
             log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
+            generate_exit_summary "$loop_count" "circuit_breaker_trip"
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
@@ -1983,6 +2036,7 @@ main() {
             if [[ "$user_choice" == "2" ]]; then
                 log_status "INFO" "User chose to exit. Exiting loop..."
                 update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit"
+                generate_exit_summary "$loop_count" "api_5hour_limit"
                 break
             else
                 # Auto-wait on timeout (empty choice) or explicit "1" — supports unattended operation
