@@ -464,7 +464,7 @@ Only searches `tail -30` of the output file, filtering out `"type":"user"`, `"to
 ### Circuit Breaker Thresholds
 - `CB_NO_PROGRESS_THRESHOLD=3` - Open circuit after 3 loops with no file changes
 - `CB_SAME_ERROR_THRESHOLD=5` - Open circuit after 5 loops with repeated errors
-- `CB_OUTPUT_DECLINE_THRESHOLD=70%` - Open circuit if output declines by >70%
+- `CB_OUTPUT_DECLINE_THRESHOLD=70%` - Open circuit if output declines by >70% (requires >=2 loops of no progress and >=2 output length history entries; last 5 output lengths tracked in state file)
 - `CB_PERMISSION_DENIAL_THRESHOLD=2` - Open circuit after 2 loops with permission denials (Issue #101)
 
 ### Circuit Breaker Auto-Recovery (Issue #160)
@@ -557,7 +557,7 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 
 ## Test Suite
 
-### Test Files (639 tests total)
+### Test Files (654 tests total)
 
 | File | Tests | Description |
 |------|-------|-------------|
@@ -582,6 +582,7 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 | `test_budget_runtime.bats` | 28 | Budget tracking (--max-cost), runtime limits (--max-hours), stale counter detection |
 | `test_retry_backoff.bats` | 21 | Exponential retry backoff (calculate_backoff_delay, config, .ralphrc integration) |
 | `test_exit_summary.bats` | 22 | Exit summary report (generate_exit_summary, stats display, all exit points) |
+| `test_output_trends.bats` | 15 | Circuit breaker output token trend tracking (decline detection, history, configurable threshold) |
 
 ### Running Tests
 ```bash

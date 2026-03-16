@@ -8,7 +8,7 @@
 ## Medium Priority
 - [x] Add retry backoff for transient errors (currently flat 30s sleep on failure)
 - [x] Add a summary report on graceful exit showing total loops, estimated cost, files changed, and duration
-- [ ] Improve circuit breaker: track output token trends across loops for cost estimation
+- [x] Improve circuit breaker: track output token trends across loops for cost estimation
 
 ## Low Priority
 - [ ] Add `--dry-run` flag that validates config and simulates one loop without calling Claude

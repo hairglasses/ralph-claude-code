@@ -52,6 +52,7 @@ init_circuit_breaker() {
     "consecutive_permission_denials": 0,
     "last_progress_loop": 0,
     "total_opens": 0,
+    "output_lengths": [],
     "reason": ""
 }
 EOF
@@ -90,6 +91,7 @@ EOF
     "consecutive_permission_denials": 0,
     "last_progress_loop": 0,
     "total_opens": $total_opens,
+    "output_lengths": [],
     "reason": "Auto-reset on startup"
 }
 EOF
@@ -455,6 +457,7 @@ reset_circuit_breaker() {
     "consecutive_permission_denials": 0,
     "last_progress_loop": 0,
     "total_opens": 0,
+    "output_lengths": [],
     "reason": "$reason"
 }
 EOF
