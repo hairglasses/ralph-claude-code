@@ -139,6 +139,12 @@ load_ralphrc() {
         return 0
     fi
 
+    # Validate .ralphrc syntax before sourcing to prevent broken config from crashing the loop
+    if ! bash -n "$RALPHRC_FILE" 2>/dev/null; then
+        log_status "ERROR" ".ralphrc has syntax errors — using defaults. Fix with: bash -n $RALPHRC_FILE"
+        return 1
+    fi
+
     # Source .ralphrc (this may override default values)
     # shellcheck source=/dev/null
     source "$RALPHRC_FILE"
@@ -431,6 +437,84 @@ log_status() {
     # Push to hgmux sidebar if available
     if is_hgmux; then
         hgmux_log "$level" "$message"
+    fi
+}
+
+# Check and create marathon checkpoints (git tags at regular intervals)
+# Only active when MARATHON_MODE=true
+check_marathon_checkpoint() {
+    if [[ "${MARATHON_MODE:-false}" != "true" ]]; then
+        return 0
+    fi
+
+    local marathon_start=${MARATHON_START_TIME:-$(date +%s)}
+    local interval_hours=${MARATHON_CHECKPOINT_INTERVAL:-6}
+    local now
+    now=$(date +%s)
+    local elapsed_hours
+    elapsed_hours=$(awk "BEGIN {printf \"%.2f\", ($now - $marathon_start) / 3600}")
+    local elapsed_whole
+    elapsed_whole=$(awk "BEGIN {printf \"%d\", ($now - $marathon_start) / 3600}")
+
+    # Determine which checkpoint number we should be at
+    local checkpoint_num=0
+    if [[ $interval_hours -gt 0 ]]; then
+        checkpoint_num=$((elapsed_whole / interval_hours))
+    fi
+
+    if [[ $checkpoint_num -le 0 ]]; then
+        return 0
+    fi
+
+    # Read last checkpoint to avoid duplicates
+    local last_checkpoint=0
+    if [[ -f "$RALPH_DIR/.last_checkpoint_hour" ]]; then
+        last_checkpoint=$(cat "$RALPH_DIR/.last_checkpoint_hour" 2>/dev/null || echo "0")
+        last_checkpoint=$((last_checkpoint + 0))
+    fi
+
+    local expected_hour=$((checkpoint_num * interval_hours))
+    if [[ $expected_hour -le $last_checkpoint ]]; then
+        return 0  # Already created this checkpoint
+    fi
+
+    # Create checkpoint
+    local tag_name="marathon-checkpoint-${checkpoint_num}"
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        if ! git tag -l "$tag_name" | grep -q "$tag_name"; then
+            git tag "$tag_name" 2>/dev/null || true
+            log_status "INFO" "Marathon checkpoint: $tag_name at ${elapsed_hours}h elapsed"
+        fi
+    fi
+    echo "$expected_hour" > "$RALPH_DIR/.last_checkpoint_hour"
+}
+
+# Rotate logs: delete old logs and enforce size limit
+# Called at startup and once per loop iteration
+rotate_logs() {
+    local retention_days=${LOG_RETENTION_DAYS:-7}
+    local max_size_mb=${LOG_MAX_SIZE_MB:-200}
+
+    # Delete logs older than retention period
+    find "$LOG_DIR" -name "*.log" -mtime +"$retention_days" -delete 2>/dev/null || true
+
+    # If total size exceeds limit, delete oldest files until under limit
+    local total_size_kb
+    total_size_kb=$(du -sk "$LOG_DIR" 2>/dev/null | cut -f1)
+    total_size_kb=$((total_size_kb + 0))
+    local max_size_kb=$((max_size_mb * 1024))
+
+    if [[ $total_size_kb -gt $max_size_kb ]]; then
+        # Delete oldest files first (by modification time)
+        ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +2 | while IFS= read -r old_file; do
+            rm -f "$old_file" 2>/dev/null
+            total_size_kb=$(du -sk "$LOG_DIR" 2>/dev/null | cut -f1)
+            total_size_kb=$((total_size_kb + 0))
+            if [[ $total_size_kb -le $max_size_kb ]]; then
+                break
+            fi
+        done
+        log_status "INFO" "Log rotation: trimmed to ${max_size_mb}MB limit"
     fi
 }
 
@@ -797,7 +881,7 @@ build_loop_context() {
     if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
         local prev_summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null | head -c 200)
         if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
-            context+="Previous: ${prev_summary} "
+            context+="Previous: ${prev_summary}. "
         fi
     fi
 
@@ -808,6 +892,13 @@ build_loop_context() {
         if [[ "$prev_asking_questions" == "true" ]]; then
             context+="IMPORTANT: You asked questions in the previous loop. This is a headless automation loop with no human to answer. Do NOT ask questions. Choose the most conservative/safe default and proceed autonomously. "
         fi
+    fi
+
+    # Inject recent improvement journal suggestions for self-improvement feedback
+    local suggestions
+    suggestions=$(get_recent_suggestions 2>/dev/null || echo "")
+    if [[ -n "$suggestions" ]]; then
+        context+="Journal suggestions: ${suggestions}. "
     fi
 
     # Limit total length to ~500 chars
@@ -967,11 +1058,15 @@ reset_session() {
     local reset_timestamp
     reset_timestamp=$(get_iso_timestamp)
 
+    # Generate fresh session_id and populate created_at so session file is never empty
+    local new_session_id
+    new_session_id=$(generate_session_id)
+
     # Always create/overwrite the session file using jq for safe JSON escaping
     jq -n \
-        --arg session_id "" \
-        --arg created_at "" \
-        --arg last_used "" \
+        --arg session_id "$new_session_id" \
+        --arg created_at "$reset_timestamp" \
+        --arg last_used "$reset_timestamp" \
         --arg reset_at "$reset_timestamp" \
         --arg reset_reason "$reason" \
         '{
@@ -1693,15 +1788,20 @@ EOF
         local tasks_done=0
         local is_productive="false"
         if [[ -f "$RALPH_DIR/.response_analysis" ]]; then
-            tasks_done=$(jq -r '.analysis.tasks_completed // 0' "$RALPH_DIR/.response_analysis" 2>/dev/null || echo "0")
+            tasks_done=$(jq -r '.analysis.tasks_completed_this_loop // 0' "$RALPH_DIR/.response_analysis" 2>/dev/null || echo "0")
             tasks_done=$((tasks_done + 0))
         fi
         if [[ $tasks_done -gt 0 || $files_changed -gt 0 ]]; then
             is_productive="true"
         fi
 
-        record_loop_cost "$selected_model" "$loop_duration_s" "$is_productive" "$tasks_done"
+        record_loop_cost "$selected_model" "$loop_duration_s" "$is_productive" "$tasks_done" "SUCCESS"
         log_status "INFO" "Cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+
+        # Track opus usage only on success (moved from select_model so timeouts don't burn slots)
+        if [[ "$selected_model" == "opus" && "${RALPH_USAGE_MODE:-api}" == "max" ]]; then
+            increment_opus_window
+        fi
 
         # --- Improvement Journal ---
         local current_phase
@@ -1724,6 +1824,11 @@ EOF
     else
         # Clear progress file on failure
         echo '{"status": "failed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
+
+        # --- Record cost/journal for failed loops (timeout or generic) ---
+        local loop_end_time loop_duration_s
+        loop_end_time=$(date +%s)
+        loop_duration_s=$((loop_end_time - loop_start_time))
 
         # Layer 1: Timeout guard — exit code 124 is a timeout, not an API limit
         # Issue #198: Check for productive work before treating as failure
@@ -1760,10 +1865,20 @@ EOF
                 fi
             fi
 
+            # Record cost + journal so timeouts are visible to the cost governor
+            local current_phase
+            current_phase=$(grep 'CURRENT_PHASE=' .ralphrc 2>/dev/null | head -1 | sed 's/.*CURRENT_PHASE=//;s/"//g;s/#.*//' | tr -d '[:space:]')
+            current_phase=${current_phase:-unknown}
+
             if [[ $timeout_files_changed -gt 0 ]]; then
                 # Productive timeout — work was done despite the timeout
                 log_status "INFO" "⏱️ Timeout but $timeout_files_changed file(s) changed — treating iteration as productive"
                 echo '{"status": "timed_out_productive", "files_changed": '$timeout_files_changed', "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
+
+                record_loop_cost "$selected_model" "$loop_duration_s" "true" "0" "TIMEOUT"
+                log_status "INFO" "Timeout cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+                record_improvement_note "$loop_count" "$current_phase" "$selected_model" "0" "$loop_duration_s" \
+                    "$(estimate_cost "$selected_model" "$loop_duration_s")" "true" "$timeout_files_changed" "$output_file"
 
                 # Save session ID (fallback already populated by Step 1 if stream was truncated)
                 if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
@@ -1779,8 +1894,6 @@ EOF
                     update_exit_signals
                     log_analysis_summary
                 else
-                    # Clear stale response analysis to prevent next loop from reusing
-                    # old EXIT_SIGNAL, permission-denial, or question-detection state
                     log_status "WARN" "Timeout response analysis failed (exit $timeout_analysis_exit); clearing stale analysis"
                     rm -f "$RESPONSE_ANALYSIS_FILE"
                 fi
@@ -1799,6 +1912,10 @@ EOF
                 return 0
             else
                 # Idle timeout — no work detected
+                record_loop_cost "$selected_model" "$loop_duration_s" "false" "0" "TIMEOUT"
+                log_status "INFO" "Timeout cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+                record_improvement_note "$loop_count" "$current_phase" "$selected_model" "0" "$loop_duration_s" \
+                    "$(estimate_cost "$selected_model" "$loop_duration_s")" "false" "0" "$output_file"
                 log_status "WARN" "⏱️ Timeout with no detectable progress"
                 return 1
             fi
@@ -1830,6 +1947,22 @@ EOF
             return 2  # Extra Usage limit detected
         fi
 
+        # Record cost + journal for generic failures (not API limit — those consumed minimal tokens)
+        # Map exit codes to error taxonomy
+        local _error_code="UNKNOWN"
+        case $exit_code in
+            2) _error_code="API_LIMIT" ;;
+            3) _error_code="CB_TRIP" ;;
+            4) _error_code="BUDGET_EXCEEDED" ;;
+            *) _error_code="UNKNOWN" ;;
+        esac
+        record_loop_cost "$selected_model" "$loop_duration_s" "false" "0" "$_error_code"
+        log_status "INFO" "Failure cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+        local current_phase
+        current_phase=$(grep 'CURRENT_PHASE=' .ralphrc 2>/dev/null | head -1 | sed 's/.*CURRENT_PHASE=//;s/"//g;s/#.*//' | tr -d '[:space:]')
+        current_phase=${current_phase:-unknown}
+        record_improvement_note "$loop_count" "$current_phase" "$selected_model" "0" "$loop_duration_s" \
+            "$(estimate_cost "$selected_model" "$loop_duration_s")" "false" "0" "$output_file"
         log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
         return 1
     fi
@@ -1869,6 +2002,9 @@ main() {
             log_status "INFO" "Loaded configuration from .ralphrc"
         fi
     fi
+
+    # Rotate logs on startup
+    rotate_logs
 
     # Validate Claude Code CLI is available before starting
     if ! validate_claude_command; then
@@ -1951,8 +2087,17 @@ main() {
 
     log_status "INFO" "Starting main loop..."
 
+    # Capture marathon start time for checkpoint tracking
+    MARATHON_START_TIME=$(date +%s)
+
     while true; do
         loop_count=$((loop_count + 1))
+
+        # Rotate logs each iteration
+        rotate_logs
+
+        # Marathon checkpoint check
+        check_marathon_checkpoint
 
         # Update session last_used timestamp
         update_session_last_used

@@ -4,6 +4,7 @@
 
 # Source date utilities for timestamps
 source "$(dirname "${BASH_SOURCE[0]}")/date_utils.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/timeout_utils.sh"
 
 # State files
 RALPH_DIR="${RALPH_DIR:-.ralph}"
@@ -68,21 +69,33 @@ extract_retrospective() {
             end' 2>/dev/null || cat "$output_file")
     fi
 
+    # Permissive extraction — handles variations:
+    #   **Worked**: ..., **Worked:** ..., - **Worked**: ..., - Worked: ..., Worked: ...
+    #   Also handles leading whitespace and trailing bold markers
     local worked didnt suggest
-    worked=$(echo "$content" | grep -i '^\*\*Worked\*\*:' | head -1 | sed 's/^\*\*Worked\*\*:[[:space:]]*//' || true)
-    didnt=$(echo "$content" | grep -i '^\*\*Didn.t\*\*:' | head -1 | sed "s/^\*\*Didn.t\*\*:[[:space:]]*//" || true)
-    suggest=$(echo "$content" | grep -i '^\*\*Suggest\*\*:' | head -1 | sed 's/^\*\*Suggest\*\*:[[:space:]]*//' || true)
 
-    # Also try without bold markers
-    if [[ -z "$worked" ]]; then
-        worked=$(echo "$content" | grep -i '^- Worked:' | head -1 | sed 's/^- Worked:[[:space:]]*//' || true)
-    fi
-    if [[ -z "$didnt" ]]; then
-        didnt=$(echo "$content" | grep -i '^- Didn.t:' | head -1 | sed "s/^- Didn.t:[[:space:]]*//" || true)
-    fi
-    if [[ -z "$suggest" ]]; then
-        suggest=$(echo "$content" | grep -i '^- Suggest:' | head -1 | sed 's/^- Suggest:[[:space:]]*//' || true)
-    fi
+    # Helper: try multiple patterns, return first match
+    _extract_field() {
+        local field=$1
+        local result=""
+        # Pattern 1: **Field**: or **Field:**  (with optional leading - or whitespace)
+        result=$(echo "$content" | grep -i "^[[:space:]]*[-*]*[[:space:]]*\*\*${field}\*\*:" | head -1 | sed "s/^.*\*\*${field}\*\*:[[:space:]]*//" || true)
+        # Pattern 2: - Field: (no bold)
+        if [[ -z "$result" ]]; then
+            result=$(echo "$content" | grep -i "^[[:space:]]*-[[:space:]]*${field}:" | head -1 | sed "s/^.*${field}:[[:space:]]*//" || true)
+        fi
+        # Pattern 3: Field: (bare, no dash, no bold)
+        if [[ -z "$result" ]]; then
+            result=$(echo "$content" | grep -i "^[[:space:]]*${field}:" | head -1 | sed "s/^.*${field}:[[:space:]]*//" || true)
+        fi
+        # Strip trailing bold markers if any
+        result=$(echo "$result" | sed 's/\*\*[[:space:]]*$//')
+        echo "$result"
+    }
+
+    worked=$(_extract_field "Worked")
+    didnt=$(_extract_field "Didn.t")
+    suggest=$(_extract_field "Suggest")
 
     jq -n \
         --arg worked "$worked" \
@@ -224,7 +237,7 @@ Also list any manual-review items that need human attention."
     # Run sonnet with 5-minute timeout for meta-improvement
     local meta_output
     local meta_exit_code=0
-    meta_output=$(timeout 300 "$claude_cmd" --model sonnet -p "$prompt" --output-format text 2>&1) || meta_exit_code=$?
+    meta_output=$(portable_timeout 300s "$claude_cmd" --model sonnet -p "$prompt" --output-format text 2>&1) || meta_exit_code=$?
 
     if [[ $meta_exit_code -ne 0 ]]; then
         echo "Meta-improvement call failed (exit $meta_exit_code)" >&2
@@ -270,6 +283,27 @@ Also list any manual-review items that need human attention."
     echo "Meta-improvement cycle complete. Results saved to $META_IMPROVEMENTS_FILE" >&2
 }
 
+# Get recent suggestions from the improvement journal
+# Returns newline-delimited list of recent suggestions (max 300 chars total)
+# Usage: get_recent_suggestions
+get_recent_suggestions() {
+    if [[ ! -f "$IMPROVEMENT_JOURNAL_FILE" ]] || [[ ! -s "$IMPROVEMENT_JOURNAL_FILE" ]]; then
+        echo ""
+        return
+    fi
+
+    local suggestions
+    suggestions=$(tail -3 "$IMPROVEMENT_JOURNAL_FILE" | jq -r '.suggest // empty' 2>/dev/null | grep -v '^$')
+
+    if [[ -z "$suggestions" ]]; then
+        echo ""
+        return
+    fi
+
+    # Truncate to 300 chars max
+    echo "${suggestions:0:300}"
+}
+
 # Export functions
 export -f init_improvement_journal
 export -f extract_retrospective
@@ -278,3 +312,4 @@ export -f increment_successful_loops
 export -f get_successful_loop_count
 export -f should_run_meta_improvement
 export -f run_meta_improvement
+export -f get_recent_suggestions

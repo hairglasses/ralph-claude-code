@@ -70,9 +70,12 @@ EOF
         echo '[]' > "$CB_HISTORY_FILE"
     fi
 
-    # Auto-recovery: check if OPEN state should transition (Issue #160)
+    # Log initial state on startup so .circuit_breaker_history always has entries
     local current_state
     current_state=$(jq -r '.state' "$CB_STATE_FILE" 2>/dev/null || echo "$CB_STATE_CLOSED")
+    log_circuit_transition "INIT" "$current_state" "Session start" "0"
+
+    # Auto-recovery: check if OPEN state should transition (Issue #160)
 
     if [[ "$current_state" == "$CB_STATE_OPEN" ]]; then
         if [[ "$CB_AUTO_RESET" == "true" ]]; then

@@ -28,8 +28,6 @@ SIMPLE_TASK_PATTERNS=(
     "PROMPT"
     "ralphrc"
     "report"
-    "audit.*md"
-    "spec.*md"
 )
 
 # Check if the next task in fix_plan.md is simple
@@ -181,10 +179,8 @@ select_model() {
     echo "opus"
     echo "opus" > "$CURRENT_MODEL_FILE"
 
-    # Track opus usage for Max mode window
-    if [[ "$mode" == "max" ]]; then
-        increment_opus_window
-    fi
+    # NOTE: opus window increment moved to success path in ralph_loop.sh
+    # so that timeouts don't consume window slots
 
     return 0
 }

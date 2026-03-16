@@ -349,6 +349,18 @@ analyze_response() {
         return 1
     fi
 
+    # Size guard: truncate files >10MB to prevent hangs on huge output
+    local file_size_bytes
+    file_size_bytes=$(wc -c < "$output_file" 2>/dev/null || echo "0")
+    file_size_bytes=$((file_size_bytes + 0))
+    local max_size_bytes=$((10 * 1024 * 1024))
+    if [[ $file_size_bytes -gt $max_size_bytes ]]; then
+        echo "WARN: Output file is ${file_size_bytes} bytes (>10MB), truncating for analysis" >&2
+        local truncated_file="${output_file}.truncated"
+        head -c "$max_size_bytes" "$output_file" > "$truncated_file"
+        output_file="$truncated_file"
+    fi
+
     local output_content=$(cat "$output_file")
     local output_length=${#output_content}
 
@@ -391,6 +403,20 @@ analyze_response() {
             local question_count=0
             if question_count=$(detect_questions "$work_summary"); then
                 asking_questions=true
+            fi
+
+            # Extract TASKS_COMPLETED_THIS_LOOP from JSON .result text field
+            local tasks_completed_this_loop=0
+            if [[ "$has_result_field" == "true" ]]; then
+                local result_text_for_tasks
+                result_text_for_tasks=$(jq -r '.result // ""' "$RALPH_DIR/.json_parse_result" 2>/dev/null)
+                if [[ -n "$result_text_for_tasks" ]] && echo "$result_text_for_tasks" | grep -q "TASKS_COMPLETED_THIS_LOOP:"; then
+                    local tasks_str
+                    tasks_str=$(echo "$result_text_for_tasks" | grep "TASKS_COMPLETED_THIS_LOOP:" | head -1 | cut -d: -f2 | xargs)
+                    if [[ -n "$tasks_str" && "$tasks_str" =~ ^[0-9]+$ ]]; then
+                        tasks_completed_this_loop=$((tasks_str + 0))
+                    fi
+                fi
             fi
 
             # Check for file changes via git (supplements JSON data)
@@ -446,6 +472,7 @@ analyze_response() {
                 --argjson exit_signal "$exit_signal" \
                 --arg work_summary "$work_summary" \
                 --argjson output_length "$output_length" \
+                --argjson tasks_completed_this_loop "$tasks_completed_this_loop" \
                 --argjson has_permission_denials "$has_permission_denials" \
                 --argjson permission_denial_count "$permission_denial_count" \
                 --argjson denied_commands "$denied_commands_json" \
@@ -466,6 +493,7 @@ analyze_response() {
                         exit_signal: $exit_signal,
                         work_summary: $work_summary,
                         output_length: $output_length,
+                        tasks_completed_this_loop: $tasks_completed_this_loop,
                         has_permission_denials: $has_permission_denials,
                         permission_denial_count: $permission_denial_count,
                         denied_commands: $denied_commands,
@@ -507,6 +535,16 @@ analyze_response() {
             has_completion_signal=true
             exit_signal=true
             confidence_score=100
+        fi
+    fi
+
+    # 1b. Extract TASKS_COMPLETED_THIS_LOOP from RALPH_STATUS block
+    local tasks_completed_this_loop=0
+    if grep -q -- "---RALPH_STATUS---" "$output_file"; then
+        local tasks_str
+        tasks_str=$(grep "TASKS_COMPLETED_THIS_LOOP:" "$output_file" | head -1 | cut -d: -f2 | xargs)
+        if [[ -n "$tasks_str" && "$tasks_str" =~ ^[0-9]+$ ]]; then
+            tasks_completed_this_loop=$((tasks_str + 0))
         fi
     fi
 
@@ -659,6 +697,7 @@ analyze_response() {
         --argjson exit_signal "$exit_signal" \
         --arg work_summary "$work_summary" \
         --argjson output_length "$output_length" \
+        --argjson tasks_completed_this_loop "$tasks_completed_this_loop" \
         --argjson asking_questions "$asking_questions" \
         --argjson question_count "$question_count" \
         '{
@@ -676,6 +715,7 @@ analyze_response() {
                 exit_signal: $exit_signal,
                 work_summary: $work_summary,
                 output_length: $output_length,
+                tasks_completed_this_loop: $tasks_completed_this_loop,
                 has_permission_denials: false,
                 permission_denial_count: 0,
                 denied_commands: [],

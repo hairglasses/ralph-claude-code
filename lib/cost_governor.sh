@@ -15,12 +15,13 @@ COST_LEDGER_FILE="$RALPH_DIR/cost_ledger.jsonl"
 COST_SUMMARY_FILE="$RALPH_DIR/cost_summary.json"
 
 # Cost estimates per minute by model (based on typical token throughput at published pricing)
-# opus: ~$0.60/min, sonnet: ~$0.10/min
+# opus: ~$4.50/min (input ~150K tok/min @ $15/M + output ~4K tok/min @ $75/M ≈ $2.55+$0.30 + overhead)
+# sonnet: ~$0.30/min (input ~150K tok/min @ $3/M + output ~4K tok/min @ $15/M)
 _cost_per_minute() {
     case "$1" in
-        opus)   echo "0.60" ;;
-        sonnet) echo "0.10" ;;
-        *)      echo "0.60" ;;
+        opus)   echo "4.50" ;;
+        sonnet) echo "0.30" ;;
+        *)      echo "4.50" ;;
     esac
 }
 
@@ -61,12 +62,13 @@ estimate_cost() {
 }
 
 # Record cost for a completed loop
-# Usage: record_loop_cost "opus" 900 true 3
+# Usage: record_loop_cost "opus" 900 true 3 "SUCCESS"
 record_loop_cost() {
     local model=$1
     local duration_secs=$2
     local productive=$3
     local tasks_done=${4:-0}
+    local error_code=${5:-"UNKNOWN"}
 
     init_cost_tracking
 
@@ -92,7 +94,8 @@ record_loop_cost() {
         --argjson cost_usd "$cost" \
         --argjson productive "$productive" \
         --argjson tasks_done "$tasks_done" \
-        '{ts: $ts, loop: $loop, model: $model, duration_s: $duration_s, cost_usd: $cost_usd, productive: $productive, tasks_done: $tasks_done}')
+        --arg error_code "$error_code" \
+        '{ts: $ts, loop: $loop, model: $model, duration_s: $duration_s, cost_usd: $cost_usd, productive: $productive, tasks_done: $tasks_done, error_code: $error_code}')
     echo "$entry" >> "$COST_LEDGER_FILE"
 
     # Update summary
