@@ -1,0 +1,61 @@
+# .ralphrc - Ralph project configuration
+# Project: ralph-claude-code (self-improvement loop)
+# Budget: $100 over 12 hours
+
+# =============================================================================
+# PROJECT IDENTIFICATION
+# =============================================================================
+PROJECT_NAME="ralph-claude-code"
+PROJECT_TYPE="bash"
+
+# =============================================================================
+# LOOP SETTINGS — BUDGET-OPTIMIZED for $100 / 12 hours
+# =============================================================================
+
+# Conservative rate: ~5 calls/hour * 12 hours = 60 max calls
+# At ~$1.50 avg per call = ~$90, leaving $10 buffer
+MAX_CALLS_PER_HOUR=5
+
+# Generous timeout: let each invocation do meaningful work
+# 30 minutes per call balances cost (longer = more tokens) vs productivity
+CLAUDE_TIMEOUT_MINUTES=30
+
+# JSON for structured response parsing
+CLAUDE_OUTPUT_FORMAT="json"
+
+# =============================================================================
+# TOOL PERMISSIONS
+# =============================================================================
+# Safe git subcommands + bats for testing this project
+ALLOWED_TOOLS="Write,Read,Edit,Glob,Grep,Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git checkout *),Bash(git branch *),Bash(git stash *),Bash(git merge *),Bash(git tag *),Bash(npm *),Bash(npx *),Bash(bats *)"
+
+# =============================================================================
+# SESSION MANAGEMENT
+# =============================================================================
+SESSION_CONTINUITY=true
+SESSION_EXPIRY_HOURS=24
+
+# =============================================================================
+# CIRCUIT BREAKER THRESHOLDS — tuned for slow loop cadence
+# =============================================================================
+
+# With only 5 calls/hour, 3 no-progress loops = 36 min — too aggressive
+# Raise to 5 to give more time for complex tasks
+CB_NO_PROGRESS_THRESHOLD=5
+
+# Same error 5x still reasonable
+CB_SAME_ERROR_THRESHOLD=5
+
+CB_OUTPUT_DECLINE_THRESHOLD=70
+
+# Auto-recover after 45 min cooldown (enough for rate limit reset)
+CB_COOLDOWN_MINUTES=45
+
+# For unattended 12hr operation: auto-reset is essential
+CB_AUTO_RESET=true
+
+# =============================================================================
+# ADVANCED SETTINGS
+# =============================================================================
+CLAUDE_MIN_VERSION="2.0.76"
+RALPH_VERBOSE=false

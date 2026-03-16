@@ -155,12 +155,12 @@ record_loop_result() {
 
     init_circuit_breaker
 
-    local state_data=$(cat "$CB_STATE_FILE")
-    local current_state=$(echo "$state_data" | jq -r '.state')
-    local consecutive_no_progress=$(echo "$state_data" | jq -r '.consecutive_no_progress' | tr -d '[:space:]')
-    local consecutive_same_error=$(echo "$state_data" | jq -r '.consecutive_same_error' | tr -d '[:space:]')
-    local consecutive_permission_denials=$(echo "$state_data" | jq -r '.consecutive_permission_denials // 0' | tr -d '[:space:]')
-    local last_progress_loop=$(echo "$state_data" | jq -r '.last_progress_loop' | tr -d '[:space:]')
+    local state_data=$(cat "$CB_STATE_FILE" 2>/dev/null || echo '{}')
+    local current_state=$(echo "$state_data" | jq -r '.state // "CLOSED"' 2>/dev/null || echo "CLOSED")
+    local consecutive_no_progress=$(echo "$state_data" | jq -r '.consecutive_no_progress // 0' 2>/dev/null | tr -d '[:space:]')
+    local consecutive_same_error=$(echo "$state_data" | jq -r '.consecutive_same_error // 0' 2>/dev/null | tr -d '[:space:]')
+    local consecutive_permission_denials=$(echo "$state_data" | jq -r '.consecutive_permission_denials // 0' 2>/dev/null | tr -d '[:space:]')
+    local last_progress_loop=$(echo "$state_data" | jq -r '.last_progress_loop // 0' 2>/dev/null | tr -d '[:space:]')
 
     # Ensure integers
     consecutive_no_progress=$((consecutive_no_progress + 0))
@@ -280,7 +280,7 @@ record_loop_result() {
     esac
 
     # Update state file
-    local total_opens=$(echo "$state_data" | jq -r '.total_opens' | tr -d '[:space:]')
+    local total_opens=$(echo "$state_data" | jq -r '.total_opens // 0' 2>/dev/null | tr -d '[:space:]')
     total_opens=$((total_opens + 0))
     if [[ "$new_state" == "$CB_STATE_OPEN" && "$current_state" != "$CB_STATE_OPEN" ]]; then
         total_opens=$((total_opens + 1))
@@ -340,7 +340,7 @@ log_circuit_transition() {
         \"reason\": \"$reason\"
     }"
 
-    history=$(echo "$history" | jq ". += [$transition]")
+    history=$(echo "$history" | jq ". += [$transition]" 2>/dev/null || echo "[$transition]")
     echo "$history" > "$CB_HISTORY_FILE"
 
     # Console log with colors
@@ -364,13 +364,13 @@ log_circuit_transition() {
 show_circuit_status() {
     init_circuit_breaker
 
-    local state_data=$(cat "$CB_STATE_FILE")
-    local state=$(echo "$state_data" | jq -r '.state')
-    local reason=$(echo "$state_data" | jq -r '.reason')
-    local no_progress=$(echo "$state_data" | jq -r '.consecutive_no_progress')
-    local last_progress=$(echo "$state_data" | jq -r '.last_progress_loop')
-    local current_loop=$(echo "$state_data" | jq -r '.current_loop')
-    local total_opens=$(echo "$state_data" | jq -r '.total_opens')
+    local state_data=$(cat "$CB_STATE_FILE" 2>/dev/null || echo '{}')
+    local state=$(echo "$state_data" | jq -r '.state // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+    local reason=$(echo "$state_data" | jq -r '.reason // ""' 2>/dev/null || echo "")
+    local no_progress=$(echo "$state_data" | jq -r '.consecutive_no_progress // 0' 2>/dev/null || echo "0")
+    local last_progress=$(echo "$state_data" | jq -r '.last_progress_loop // 0' 2>/dev/null || echo "0")
+    local current_loop=$(echo "$state_data" | jq -r '.current_loop // 0' 2>/dev/null || echo "0")
+    local total_opens=$(echo "$state_data" | jq -r '.total_opens // 0' 2>/dev/null || echo "0")
 
     local color=""
     local status_icon=""
