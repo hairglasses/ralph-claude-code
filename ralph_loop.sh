@@ -48,6 +48,9 @@ _env_CB_AUTO_RESET="${CB_AUTO_RESET:-}"
 _env_CLAUDE_CODE_CMD="${CLAUDE_CODE_CMD:-}"
 _env_MAX_COST="${MAX_COST:-}"
 _env_MAX_HOURS="${MAX_HOURS:-}"
+_env_RETRY_BACKOFF_INITIAL="${RETRY_BACKOFF_INITIAL:-}"
+_env_RETRY_BACKOFF_MAX="${RETRY_BACKOFF_MAX:-}"
+_env_RETRY_BACKOFF_MULTIPLIER="${RETRY_BACKOFF_MULTIPLIER:-}"
 
 # Now set defaults (only if not already set by environment)
 MAX_CALLS_PER_HOUR="${MAX_CALLS_PER_HOUR:-100}"
@@ -98,6 +101,12 @@ MAX_HOURS="${MAX_HOURS:-0}"         # 0 = unlimited, otherwise max runtime hours
 TOTAL_COST_FILE="$RALPH_DIR/.total_cost"
 START_TIME_FILE="$RALPH_DIR/.start_time"
 
+# Retry backoff configuration for transient errors
+RETRY_BACKOFF_INITIAL="${RETRY_BACKOFF_INITIAL:-30}"    # Initial backoff in seconds
+RETRY_BACKOFF_MAX="${RETRY_BACKOFF_MAX:-300}"            # Maximum backoff in seconds (5 minutes)
+RETRY_BACKOFF_MULTIPLIER="${RETRY_BACKOFF_MULTIPLIER:-2}" # Exponential multiplier
+CONSECUTIVE_ERRORS=0                                      # Tracked at runtime, not persisted
+
 # Exit detection configuration
 EXIT_SIGNALS_FILE="$RALPH_DIR/.exit_signals"
 RESPONSE_ANALYSIS_FILE="$RALPH_DIR/.response_analysis"
@@ -126,6 +135,9 @@ RALPHRC_LOADED=false
 #   - CB_OUTPUT_DECLINE_THRESHOLD
 #   - RALPH_VERBOSE
 #   - CLAUDE_CODE_CMD (path or command for Claude Code CLI)
+#   - RETRY_BACKOFF_INITIAL (initial backoff delay in seconds, default 30)
+#   - RETRY_BACKOFF_MAX (maximum backoff delay in seconds, default 300)
+#   - RETRY_BACKOFF_MULTIPLIER (exponential multiplier, default 2)
 #
 load_ralphrc() {
     if [[ ! -f "$RALPHRC_FILE" ]]; then
@@ -165,6 +177,9 @@ load_ralphrc() {
     [[ -n "$_env_CLAUDE_CODE_CMD" ]] && CLAUDE_CODE_CMD="$_env_CLAUDE_CODE_CMD"
     [[ -n "$_env_MAX_COST" ]] && MAX_COST="$_env_MAX_COST"
     [[ -n "$_env_MAX_HOURS" ]] && MAX_HOURS="$_env_MAX_HOURS"
+    [[ -n "$_env_RETRY_BACKOFF_INITIAL" ]] && RETRY_BACKOFF_INITIAL="$_env_RETRY_BACKOFF_INITIAL"
+    [[ -n "$_env_RETRY_BACKOFF_MAX" ]] && RETRY_BACKOFF_MAX="$_env_RETRY_BACKOFF_MAX"
+    [[ -n "$_env_RETRY_BACKOFF_MULTIPLIER" ]] && RETRY_BACKOFF_MULTIPLIER="$_env_RETRY_BACKOFF_MULTIPLIER"
 
     RALPHRC_LOADED=true
     return 0
@@ -640,6 +655,44 @@ get_elapsed_runtime() {
     local hours=$((elapsed / 3600))
     local minutes=$(((elapsed % 3600) / 60))
     echo "${hours}h ${minutes}m"
+}
+
+# Calculate exponential backoff delay for transient errors
+# Uses CONSECUTIVE_ERRORS to determine delay:
+#   Error 1: RETRY_BACKOFF_INITIAL (30s)
+#   Error 2: 30 * 2 = 60s
+#   Error 3: 30 * 4 = 120s
+#   Error 4: 30 * 8 = 240s
+#   Error 5+: capped at RETRY_BACKOFF_MAX (300s)
+# Returns the delay in seconds via stdout
+calculate_backoff_delay() {
+    local errors=${1:-$CONSECUTIVE_ERRORS}
+    if [[ $errors -le 0 ]]; then
+        echo "$RETRY_BACKOFF_INITIAL"
+        return
+    fi
+
+    # Calculate: initial * multiplier^(errors-1)
+    # Use bash arithmetic — errors-1 because first error gets initial delay
+    local exponent=$((errors - 1))
+    local delay=$RETRY_BACKOFF_INITIAL
+    local i=0
+    while [[ $i -lt $exponent ]]; do
+        delay=$((delay * RETRY_BACKOFF_MULTIPLIER))
+        i=$((i + 1))
+        # Early exit if already at max
+        if [[ $delay -ge $RETRY_BACKOFF_MAX ]]; then
+            delay=$RETRY_BACKOFF_MAX
+            break
+        fi
+    done
+
+    # Cap at maximum
+    if [[ $delay -gt $RETRY_BACKOFF_MAX ]]; then
+        delay=$RETRY_BACKOFF_MAX
+    fi
+
+    echo "$delay"
 }
 
 # Check if we should gracefully exit
@@ -1899,6 +1952,9 @@ main() {
         if [ $exec_result -eq 0 ]; then
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
 
+            # Reset consecutive error counter on success
+            CONSECUTIVE_ERRORS=0
+
             # Brief pause between successful executions
             sleep 5
         elif [ $exec_result -eq 3 ]; then
@@ -1947,9 +2003,12 @@ main() {
                 printf "\n"
             fi
         else
+            CONSECUTIVE_ERRORS=$((CONSECUTIVE_ERRORS + 1))
+            local backoff_delay
+            backoff_delay=$(calculate_backoff_delay "$CONSECUTIVE_ERRORS")
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
-            log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
-            sleep 30
+            log_status "WARN" "Execution failed (attempt $CONSECUTIVE_ERRORS), retrying in ${backoff_delay}s..."
+            sleep "$backoff_delay"
         fi
         
         log_status "LOOP" "=== Completed Loop #$loop_count ==="

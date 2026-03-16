@@ -228,6 +228,15 @@ The loop is controlled by several key files and environment variables within the
 - Configurable via `.ralphrc`: `MAX_COST=10` and `MAX_HOURS=8`
 - Environment variables take precedence over `.ralphrc` values
 
+### Retry Backoff for Transient Errors
+- On transient errors, Ralph uses exponential backoff instead of a flat sleep
+- Sequence: 30s → 60s → 120s → 240s → 300s (capped)
+- Resets to initial delay on successful execution
+- Configurable via `.ralphrc` or environment variables:
+  - `RETRY_BACKOFF_INITIAL=30` — Initial backoff delay in seconds
+  - `RETRY_BACKOFF_MAX=300` — Maximum backoff delay in seconds (5 minutes)
+  - `RETRY_BACKOFF_MULTIPLIER=2` — Exponential multiplier
+
 ### Modern CLI Configuration (Phase 1.1)
 
 Ralph uses modern Claude Code CLI flags for structured communication:
@@ -537,7 +546,7 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 
 ## Test Suite
 
-### Test Files (596 tests total)
+### Test Files (617 tests total)
 
 | File | Tests | Description |
 |------|-------|-------------|
@@ -560,6 +569,7 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 | `test_file_protection.bats` | 22 | File integrity validation (RALPH_REQUIRED_PATHS, validate_ralph_integrity, get_integrity_report) (Issue #149) |
 | `test_integrity_check.bats` | 12 | Pre-loop integrity check in ralph_loop.sh (startup + in-loop validation) (Issue #149) |
 | `test_budget_runtime.bats` | 28 | Budget tracking (--max-cost), runtime limits (--max-hours), stale counter detection |
+| `test_retry_backoff.bats` | 21 | Exponential retry backoff (calculate_backoff_delay, config, .ralphrc integration) |
 
 ### Running Tests
 ```bash

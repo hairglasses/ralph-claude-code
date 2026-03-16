@@ -6,7 +6,7 @@
 - [x] Improve stale call counter detection: reset counter if TIMESTAMP_FILE hour is >1 hour old (not just different hour)
 
 ## Medium Priority
-- [ ] Add retry backoff for transient errors (currently flat 30s sleep on failure)
+- [x] Add retry backoff for transient errors (currently flat 30s sleep on failure)
 - [ ] Add a summary report on graceful exit showing total loops, estimated cost, files changed, and duration
 - [ ] Improve circuit breaker: track output token trends across loops for cost estimation
 
