@@ -1,9 +1,9 @@
 # Ralph Fix Plan - ralph-claude-code
 
 ## High Priority
-- [ ] Add a `--max-cost` CLI flag that tracks estimated API spend and halts the loop when the budget is exhausted
-- [ ] Add a `--max-hours` CLI flag that gracefully exits after N hours of total runtime
-- [ ] Improve stale call counter detection: reset counter if TIMESTAMP_FILE hour is >1 hour old (not just different hour)
+- [x] Add a `--max-cost` CLI flag that tracks estimated API spend and halts the loop when the budget is exhausted
+- [x] Add a `--max-hours` CLI flag that gracefully exits after N hours of total runtime
+- [x] Improve stale call counter detection: reset counter if TIMESTAMP_FILE hour is >1 hour old (not just different hour)
 
 ## Medium Priority
 - [ ] Add retry backoff for transient errors (currently flat 30s sleep on failure)

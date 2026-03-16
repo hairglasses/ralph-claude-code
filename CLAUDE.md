@@ -159,6 +159,11 @@ ralph --auto-reset-circuit   # Auto-reset OPEN state on startup
 
 # Session management
 ralph --reset-session    # Reset session state manually
+
+# Budget and runtime limits
+ralph --max-cost 10              # Halt after $10 estimated spend
+ralph --max-hours 8              # Halt after 8 hours of runtime
+ralph --max-cost 25 --max-hours 12  # Both limits combined
 ```
 
 ### Monitoring
@@ -209,6 +214,19 @@ The loop is controlled by several key files and environment variables within the
 - Default: 100 API calls per hour (configurable via `--calls` flag)
 - Automatic hourly reset with countdown display
 - Call tracking persists across script restarts
+- Stale counter detection: resets if timestamp file is >1 hour old (epoch-based check)
+
+### Budget & Runtime Limits
+- `--max-cost USD` — Halts the loop when estimated API spend exceeds the given USD amount
+  - Cost extracted from Claude CLI's `costUsd` field in JSON output after each loop
+  - Accumulated in `.ralph/.total_cost` across loop iterations
+  - Supports decimal values (e.g., `--max-cost 5.50`)
+- `--max-hours HOURS` — Halts the loop after N hours of total runtime
+  - Start time recorded in `.ralph/.start_time` on first loop start
+  - Supports decimal values (e.g., `--max-hours 2.5`)
+- Both limits can be combined: `ralph --max-cost 25 --max-hours 12`
+- Configurable via `.ralphrc`: `MAX_COST=10` and `MAX_HOURS=8`
+- Environment variables take precedence over `.ralphrc` values
 
 ### Modern CLI Configuration (Phase 1.1)
 
@@ -519,7 +537,7 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 
 ## Test Suite
 
-### Test Files (568 tests total)
+### Test Files (596 tests total)
 
 | File | Tests | Description |
 |------|-------|-------------|
@@ -541,6 +559,7 @@ Ralph uses a multi-layered strategy to prevent Claude from accidentally deleting
 | `test_wizard_utils.bats` | 20 | Wizard utility functions (stdout/stderr separation, prompt functions) |
 | `test_file_protection.bats` | 22 | File integrity validation (RALPH_REQUIRED_PATHS, validate_ralph_integrity, get_integrity_report) (Issue #149) |
 | `test_integrity_check.bats` | 12 | Pre-loop integrity check in ralph_loop.sh (startup + in-loop validation) (Issue #149) |
+| `test_budget_runtime.bats` | 28 | Budget tracking (--max-cost), runtime limits (--max-hours), stale counter detection |
 
 ### Running Tests
 ```bash

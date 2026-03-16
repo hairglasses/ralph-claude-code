@@ -46,6 +46,8 @@ _env_VERBOSE_PROGRESS="${VERBOSE_PROGRESS:-}"
 _env_CB_COOLDOWN_MINUTES="${CB_COOLDOWN_MINUTES:-}"
 _env_CB_AUTO_RESET="${CB_AUTO_RESET:-}"
 _env_CLAUDE_CODE_CMD="${CLAUDE_CODE_CMD:-}"
+_env_MAX_COST="${MAX_COST:-}"
+_env_MAX_HOURS="${MAX_HOURS:-}"
 
 # Now set defaults (only if not already set by environment)
 MAX_CALLS_PER_HOUR="${MAX_CALLS_PER_HOUR:-100}"
@@ -89,6 +91,12 @@ VALID_TOOL_PATTERNS=(
     "Bash(node *)"
     "NotebookEdit"
 )
+
+# Budget and runtime limits
+MAX_COST="${MAX_COST:-0}"           # 0 = unlimited, otherwise max USD spend
+MAX_HOURS="${MAX_HOURS:-0}"         # 0 = unlimited, otherwise max runtime hours
+TOTAL_COST_FILE="$RALPH_DIR/.total_cost"
+START_TIME_FILE="$RALPH_DIR/.start_time"
 
 # Exit detection configuration
 EXIT_SIGNALS_FILE="$RALPH_DIR/.exit_signals"
@@ -155,6 +163,8 @@ load_ralphrc() {
     [[ -n "$_env_CB_COOLDOWN_MINUTES" ]] && CB_COOLDOWN_MINUTES="$_env_CB_COOLDOWN_MINUTES"
     [[ -n "$_env_CB_AUTO_RESET" ]] && CB_AUTO_RESET="$_env_CB_AUTO_RESET"
     [[ -n "$_env_CLAUDE_CODE_CMD" ]] && CLAUDE_CODE_CMD="$_env_CLAUDE_CODE_CMD"
+    [[ -n "$_env_MAX_COST" ]] && MAX_COST="$_env_MAX_COST"
+    [[ -n "$_env_MAX_HOURS" ]] && MAX_HOURS="$_env_MAX_HOURS"
 
     RALPHRC_LOADED=true
     return 0
@@ -332,6 +342,14 @@ setup_tmux_session() {
     if [[ "$CB_AUTO_RESET" == "true" ]]; then
         ralph_cmd="$ralph_cmd --auto-reset-circuit"
     fi
+    # Forward --max-cost if set
+    if [[ "$MAX_COST" != "0" ]]; then
+        ralph_cmd="$ralph_cmd --max-cost $MAX_COST"
+    fi
+    # Forward --max-hours if set
+    if [[ "$MAX_HOURS" != "0" ]]; then
+        ralph_cmd="$ralph_cmd --max-hours $MAX_HOURS"
+    fi
 
     # Chain tmux kill-session after the loop command so the entire tmux
     # session is torn down when the Ralph loop exits (graceful completion,
@@ -367,7 +385,6 @@ setup_tmux_session() {
 
 # Initialize call tracking
 init_call_tracking() {
-    # Debug logging removed for cleaner output
     local current_hour=$(date +%Y%m%d%H)
     local last_reset_hour=""
 
@@ -375,8 +392,26 @@ init_call_tracking() {
         last_reset_hour=$(cat "$TIMESTAMP_FILE")
     fi
 
-    # Reset counter if it's a new hour
+    # Reset counter if it's a new hour OR if the timestamp is >1 hour old
+    # The >1 hour check handles edge cases where the hour string changes but
+    # the counter file was written more than an hour ago (e.g., system sleep,
+    # script restart after long pause) — Issue #196 improvement
+    local should_reset=false
     if [[ "$current_hour" != "$last_reset_hour" ]]; then
+        should_reset=true
+    elif [[ -f "$TIMESTAMP_FILE" ]]; then
+        local file_epoch
+        file_epoch=$(stat -c %Y "$TIMESTAMP_FILE" 2>/dev/null || stat -f %m "$TIMESTAMP_FILE" 2>/dev/null || echo "0")
+        local current_epoch
+        current_epoch=$(get_epoch_seconds)
+        local age=$((current_epoch - file_epoch))
+        if [[ $age -gt 3600 ]]; then
+            should_reset=true
+            log_status "INFO" "Call counter stale (${age}s old), resetting"
+        fi
+    fi
+
+    if [[ "$should_reset" == "true" ]]; then
         echo "0" > "$CALL_COUNT_FILE"
         echo "$current_hour" > "$TIMESTAMP_FILE"
         log_status "INFO" "Call counter reset for new hour: $current_hour"
@@ -488,6 +523,123 @@ wait_for_reset() {
     echo "0" > "$CALL_COUNT_FILE"
     echo "$(date +%Y%m%d%H)" > "$TIMESTAMP_FILE"
     log_status "SUCCESS" "Rate limit reset! Ready for new calls."
+}
+
+# Extract cost from Claude CLI JSON output and accumulate it
+# Claude CLI result JSON includes costUsd field
+# Returns the cost extracted (or "0" if not found)
+extract_and_accumulate_cost() {
+    local output_file=$1
+
+    if [[ ! -f "$output_file" ]]; then
+        echo "0"
+        return
+    fi
+
+    local cost="0"
+
+    # Try to extract costUsd from the output file
+    # Claude CLI array format: look for result type entry with costUsd
+    if jq -e 'type == "array"' "$output_file" >/dev/null 2>&1; then
+        cost=$(jq -r '[.[] | select(.type == "result")] | .[-1].costUsd // 0' "$output_file" 2>/dev/null || echo "0")
+    else
+        # Single object format
+        cost=$(jq -r '.costUsd // 0' "$output_file" 2>/dev/null || echo "0")
+    fi
+
+    # Ensure cost is a valid number
+    if ! echo "$cost" | grep -qE '^[0-9]+\.?[0-9]*$'; then
+        cost="0"
+    fi
+
+    # Accumulate into total cost file
+    local current_total="0"
+    if [[ -f "$TOTAL_COST_FILE" ]]; then
+        current_total=$(cat "$TOTAL_COST_FILE" 2>/dev/null || echo "0")
+    fi
+
+    local new_total
+    new_total=$(echo "$current_total + $cost" | bc 2>/dev/null || echo "$current_total")
+    echo "$new_total" > "$TOTAL_COST_FILE"
+    echo "$cost"
+}
+
+# Get the current accumulated cost
+get_total_cost() {
+    if [[ -f "$TOTAL_COST_FILE" ]]; then
+        cat "$TOTAL_COST_FILE" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# Check if cost budget has been exceeded
+# Returns 0 if budget exceeded, 1 if within budget (or no budget set)
+is_budget_exceeded() {
+    if [[ "$MAX_COST" == "0" ]]; then
+        return 1  # No budget set
+    fi
+
+    local total_cost
+    total_cost=$(get_total_cost)
+
+    # Compare using bc (supports decimals)
+    local exceeded
+    exceeded=$(echo "$total_cost >= $MAX_COST" | bc 2>/dev/null || echo "0")
+
+    if [[ "$exceeded" == "1" ]]; then
+        return 0  # Budget exceeded
+    fi
+    return 1  # Within budget
+}
+
+# Initialize start time for --max-hours tracking
+init_start_time() {
+    if [[ ! -f "$START_TIME_FILE" ]]; then
+        get_epoch_seconds > "$START_TIME_FILE"
+    fi
+}
+
+# Check if max runtime has been exceeded
+# Returns 0 if exceeded, 1 if within limit (or no limit set)
+is_max_hours_exceeded() {
+    if [[ "$MAX_HOURS" == "0" ]]; then
+        return 1  # No limit set
+    fi
+
+    if [[ ! -f "$START_TIME_FILE" ]]; then
+        return 1  # No start time recorded
+    fi
+
+    local start_epoch
+    start_epoch=$(cat "$START_TIME_FILE" 2>/dev/null || echo "0")
+    local current_epoch
+    current_epoch=$(get_epoch_seconds)
+    local elapsed_seconds=$((current_epoch - start_epoch))
+    local max_seconds
+    max_seconds=$(echo "$MAX_HOURS * 3600" | bc 2>/dev/null | cut -d. -f1)
+
+    if [[ $elapsed_seconds -ge $max_seconds ]]; then
+        return 0  # Time exceeded
+    fi
+    return 1  # Within limit
+}
+
+# Get elapsed runtime in human-readable format
+get_elapsed_runtime() {
+    if [[ ! -f "$START_TIME_FILE" ]]; then
+        echo "0h 0m"
+        return
+    fi
+
+    local start_epoch
+    start_epoch=$(cat "$START_TIME_FILE" 2>/dev/null || echo "0")
+    local current_epoch
+    current_epoch=$(get_epoch_seconds)
+    local elapsed=$((current_epoch - start_epoch))
+    local hours=$((elapsed / 3600))
+    local minutes=$(((elapsed % 3600) / 60))
+    echo "${hours}h ${minutes}m"
 }
 
 # Check if we should gracefully exit
@@ -1413,6 +1565,13 @@ EOF
         # Log analysis summary
         log_analysis_summary
 
+        # Extract and accumulate cost from Claude output (--max-cost tracking)
+        local loop_cost
+        loop_cost=$(extract_and_accumulate_cost "$output_file")
+        if [[ "$loop_cost" != "0" ]]; then
+            log_status "INFO" "💰 Loop cost: \$$loop_cost | Total: \$$(get_total_cost)"
+        fi
+
         # Get file change count for circuit breaker
         # Fix #141: Detect both uncommitted changes AND committed changes
         local files_changed=0
@@ -1547,7 +1706,16 @@ main() {
 
     log_status "SUCCESS" "🚀 Ralph loop starting with Claude Code"
     log_status "INFO" "Max calls per hour: $MAX_CALLS_PER_HOUR"
+    if [[ "$MAX_COST" != "0" ]]; then
+        log_status "INFO" "💰 Budget limit: \$$MAX_COST USD"
+    fi
+    if [[ "$MAX_HOURS" != "0" ]]; then
+        log_status "INFO" "⏰ Runtime limit: ${MAX_HOURS} hours"
+    fi
     log_status "INFO" "Logs: $LOG_DIR/ | Docs: $DOCS_DIR/ | Status: $STATUS_FILE"
+
+    # Initialize start time for --max-hours tracking
+    init_start_time
 
     # Check if project uses old flat structure and needs migration
     if [[ -f "PROMPT.md" ]] && [[ ! -d ".ralph" ]]; then
@@ -1640,6 +1808,30 @@ main() {
             continue
         fi
 
+        # Check budget limit (--max-cost)
+        if is_budget_exceeded; then
+            local total_cost
+            total_cost=$(get_total_cost)
+            log_status "WARN" "💰 Budget limit reached: \$$total_cost / \$$MAX_COST"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "budget_exceeded" "halted" "budget_limit"
+            log_status "SUCCESS" "🏁 Ralph halted - budget limit of \$$MAX_COST exceeded (spent: \$$total_cost)"
+            log_status "INFO" "  - Total loops: $loop_count"
+            log_status "INFO" "  - Runtime: $(get_elapsed_runtime)"
+            break
+        fi
+
+        # Check runtime limit (--max-hours)
+        if is_max_hours_exceeded; then
+            local elapsed
+            elapsed=$(get_elapsed_runtime)
+            log_status "WARN" "⏰ Runtime limit reached: $elapsed / ${MAX_HOURS}h"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "runtime_exceeded" "halted" "runtime_limit"
+            log_status "SUCCESS" "🏁 Ralph halted - runtime limit of ${MAX_HOURS} hours exceeded ($elapsed)"
+            log_status "INFO" "  - Total loops: $loop_count"
+            log_status "INFO" "  - Estimated cost: \$$(get_total_cost)"
+            break
+        fi
+
         # Check for graceful exit conditions
         local exit_reason=$(should_exit_gracefully)
         if [[ "$exit_reason" != "" ]]; then
@@ -1689,6 +1881,8 @@ main() {
             log_status "SUCCESS" "🎉 Ralph has completed the project! Final stats:"
             log_status "INFO" "  - Total loops: $loop_count"
             log_status "INFO" "  - API calls used: $(cat "$CALL_COUNT_FILE")"
+            log_status "INFO" "  - Estimated cost: \$$(get_total_cost)"
+            log_status "INFO" "  - Runtime: $(get_elapsed_runtime)"
             log_status "INFO" "  - Exit reason: $exit_reason"
 
             break
@@ -1786,6 +1980,10 @@ Options:
     --auto-reset-circuit    Auto-reset circuit breaker on startup (bypasses cooldown)
     --reset-session         Reset session state and exit (clears session continuity)
 
+Budget & Runtime Limits:
+    --max-cost USD          Halt loop when estimated API spend exceeds USD amount (e.g., 10 or 5.50)
+    --max-hours HOURS       Halt loop after N hours of total runtime (e.g., 8 or 2.5)
+
 Modern CLI Options (Phase 1.1):
     --output-format FORMAT  Set Claude output format: json or text (default: $CLAUDE_OUTPUT_FORMAT)
                             Note: --live mode requires JSON and will auto-switch
@@ -1817,6 +2015,9 @@ Examples:
     $0 --output-format text     # Use legacy text output format
     $0 --no-continue            # Disable session continuity
     $0 --session-expiry 48      # 48-hour session expiration
+    $0 --max-cost 10            # Halt after \$10 estimated spend
+    $0 --max-hours 8            # Halt after 8 hours of runtime
+    $0 --max-cost 25 --max-hours 12  # Both budget and runtime limits
 
 HELPEOF
 }
@@ -1921,6 +2122,22 @@ while [[ $# -gt 0 ]]; do
         --auto-reset-circuit)
             CB_AUTO_RESET=true
             shift
+            ;;
+        --max-cost)
+            if [[ -z "$2" || ! "$2" =~ ^[0-9]+\.?[0-9]*$ ]] || [[ "$2" == "0" ]]; then
+                echo "Error: --max-cost requires a positive number (USD budget, e.g., 10 or 5.50)"
+                exit 1
+            fi
+            MAX_COST="$2"
+            shift 2
+            ;;
+        --max-hours)
+            if [[ -z "$2" || ! "$2" =~ ^[0-9]+\.?[0-9]*$ ]] || [[ "$2" == "0" ]]; then
+                echo "Error: --max-hours requires a positive number (e.g., 8 or 2.5)"
+                exit 1
+            fi
+            MAX_HOURS="$2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"
