@@ -168,6 +168,39 @@ record_loop_result() {
     consecutive_permission_denials=$((consecutive_permission_denials + 0))
     last_progress_loop=$((last_progress_loop + 0))
 
+    # Track output token trends for cost estimation
+    # Read existing output_lengths history (last 5 values)
+    local output_lengths_json
+    output_lengths_json=$(echo "$state_data" | jq -r '.output_lengths // "[]"' 2>/dev/null || echo "[]")
+    # Ensure it's a valid array
+    if ! echo "$output_lengths_json" | jq 'type == "array"' >/dev/null 2>&1; then
+        output_lengths_json="[]"
+    fi
+
+    # Check for output decline trend
+    local output_declining=false
+    if [[ -n "$output_length" && "$output_length" -gt 0 ]]; then
+        local history_count
+        history_count=$(echo "$output_lengths_json" | jq 'length' 2>/dev/null || echo "0")
+
+        if [[ $history_count -ge 2 ]]; then
+            # Calculate average of previous outputs
+            local avg_output
+            avg_output=$(echo "$output_lengths_json" | jq 'add / length | floor' 2>/dev/null || echo "0")
+
+            if [[ $avg_output -gt 0 ]]; then
+                # Calculate decline percentage: (avg - current) / avg * 100
+                local decline_pct=$(( (avg_output - output_length) * 100 / avg_output ))
+                if [[ $decline_pct -ge $CB_OUTPUT_DECLINE_THRESHOLD ]]; then
+                    output_declining=true
+                fi
+            fi
+        fi
+
+        # Append current output_length and keep last 5
+        output_lengths_json=$(echo "$output_lengths_json" | jq --argjson val "$output_length" '. + [$val] | .[-5:]' 2>/dev/null || echo "[$output_length]")
+    fi
+
     # Detect progress from multiple sources:
     # 1. Files changed (git diff)
     # 2. Completion signal in response analysis (STATUS: COMPLETE or has_completion_signal)
@@ -252,6 +285,9 @@ record_loop_result() {
             elif [[ $consecutive_same_error -ge $CB_SAME_ERROR_THRESHOLD ]]; then
                 new_state="$CB_STATE_OPEN"
                 reason="Same error repeated in $consecutive_same_error consecutive loops"
+            elif [[ "$output_declining" == "true" && $consecutive_no_progress -ge 2 ]]; then
+                new_state="$CB_STATE_OPEN"
+                reason="Output declined by >$CB_OUTPUT_DECLINE_THRESHOLD% with no progress for $consecutive_no_progress loops"
             elif [[ $consecutive_no_progress -ge 2 ]]; then
                 new_state="$CB_STATE_HALF_OPEN"
                 reason="Monitoring: $consecutive_no_progress loops without progress"
@@ -306,6 +342,7 @@ record_loop_result() {
     "last_progress_loop": $last_progress_loop,
     "total_opens": $total_opens,
     "reason": "$reason",
+    "output_lengths": $output_lengths_json,
     "current_loop": $loop_number$(if [[ -n "$opened_at" ]]; then echo ",
     \"opened_at\": \"$opened_at\""; fi)
 }
@@ -399,6 +436,9 @@ show_circuit_status() {
     echo -e "${color}Last progress:${NC}        Loop #$last_progress"
     echo -e "${color}Current loop:${NC}         #$current_loop"
     echo -e "${color}Total opens:${NC}          $total_opens"
+    local output_trend
+    output_trend=$(echo "$state_data" | jq -r '.output_lengths // [] | if length > 0 then map(tostring) | join(" → ") else "no data" end' 2>/dev/null || echo "no data")
+    echo -e "${color}Output trend:${NC}         $output_trend"
     echo ""
 }
 

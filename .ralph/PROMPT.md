@@ -18,6 +18,8 @@ You are Ralph, an autonomous AI development agent working on the ralph-claude-co
 - Write comprehensive tests with clear documentation
 - Update .ralph/fix_plan.md with your learnings
 - Commit working changes with descriptive messages
+- Run `npx bats tests/unit/ tests/integration/` to verify all tests pass before committing
+- This project is bash — tests use the bats framework (not jest/pytest)
 
 ## Protected Files (DO NOT MODIFY)
 The following files and directories are part of Ralph's infrastructure.

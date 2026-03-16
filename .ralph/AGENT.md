@@ -33,9 +33,12 @@ npx bats tests/unit/test_circuit_breaker_recovery.bats
 ```
 
 ## Key Learnings
-- Update this section when you learn new build optimizations
-- Document any gotchas or special setup requirements
-- Keep track of the fastest test/build cycle
+- Tests run in ~45 seconds for all 639 tests via `npx bats tests/unit/ tests/integration/`
+- Must `unset CLAUDECODE` before launching ralph loop from inside a Claude Code session
+- Live mode (`--live`) must NOT be piped — always redirect to a file to avoid SIGPIPE death
+- The `.ralphrc` `ALLOWED_TOOLS` must include `Bash(npx *)` and `Bash(bats *)` for this project
+- Circuit breaker jq calls need `2>/dev/null || echo "fallback"` to survive corrupted state files under `set -e`
+- Budget-safe launch: `unset CLAUDECODE && nohup ./ralph_loop.sh --live --verbose > .ralph/logs/session.log 2>&1 &`
 
 ## Feature Development Quality Standards
 
