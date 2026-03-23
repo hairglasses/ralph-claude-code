@@ -1239,6 +1239,25 @@ build_claude_command() {
     local loop_context=$2
     local session_id=$3
     local model=${4:-""}
+    local speed_tier=${5:-"standard"}
+
+    # Toggle fast mode via project-level .claude/settings.local.json
+    # This file takes precedence over global settings and is gitignored
+    local settings_local=".claude/settings.local.json"
+    mkdir -p .claude
+    if [[ "$speed_tier" == "fast" ]]; then
+        if [[ -f "$settings_local" ]]; then
+            jq '.fastMode = true' "$settings_local" > "${settings_local}.tmp" && mv "${settings_local}.tmp" "$settings_local"
+        else
+            echo '{"fastMode": true}' > "$settings_local"
+        fi
+    else
+        if [[ -f "$settings_local" ]]; then
+            jq '.fastMode = false' "$settings_local" > "${settings_local}.tmp" && mv "${settings_local}.tmp" "$settings_local"
+        else
+            echo '{"fastMode": false}' > "$settings_local"
+        fi
+    fi
 
     # Reset global array
     # Note: We do NOT use --dangerously-skip-permissions here. Tool permissions
@@ -1343,7 +1362,7 @@ execute_claude_code() {
         log_status "ERROR" "Budget exceeded — halting loop"
         return 4
     fi
-    log_status "INFO" "Model: $selected_model | Budget: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+    log_status "INFO" "Model: $selected_model | Speed: $CURRENT_SPEED_TIER | Budget: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
 
     local loop_start_time
     loop_start_time=$(date +%s)
@@ -1372,7 +1391,7 @@ execute_claude_code() {
     # Build the Claude CLI command with modern flags (including model)
     local use_modern_cli=false
 
-    if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id" "$selected_model"; then
+    if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id" "$selected_model" "$CURRENT_SPEED_TIER"; then
         use_modern_cli=true
         log_status "INFO" "Using modern CLI mode (${CLAUDE_OUTPUT_FORMAT} output)"
     else
@@ -1795,8 +1814,8 @@ EOF
             is_productive="true"
         fi
 
-        record_loop_cost "$selected_model" "$loop_duration_s" "$is_productive" "$tasks_done" "SUCCESS"
-        log_status "INFO" "Cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+        record_loop_cost "$selected_model" "$loop_duration_s" "$is_productive" "$tasks_done" "SUCCESS" "$CURRENT_SPEED_TIER"
+        log_status "INFO" "Cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
 
         # Track opus usage only on success (moved from select_model so timeouts don't burn slots)
         if [[ "$selected_model" == "opus" && "${RALPH_USAGE_MODE:-api}" == "max" ]]; then
@@ -1808,7 +1827,7 @@ EOF
         current_phase=$(grep 'CURRENT_PHASE=' .ralphrc 2>/dev/null | head -1 | sed 's/.*CURRENT_PHASE=//;s/"//g;s/#.*//' | tr -d '[:space:]')
         current_phase=${current_phase:-unknown}
         record_improvement_note "$loop_count" "$current_phase" "$selected_model" "$tasks_done" "$loop_duration_s" \
-            "$(estimate_cost "$selected_model" "$loop_duration_s")" "$is_productive" "$files_changed" "$output_file"
+            "$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER")" "$is_productive" "$files_changed" "$output_file" "$CURRENT_SPEED_TIER"
 
         # Increment successful loop count and check for meta-improvement
         if [[ "$is_productive" == "true" ]]; then
@@ -1875,10 +1894,10 @@ EOF
                 log_status "INFO" "⏱️ Timeout but $timeout_files_changed file(s) changed — treating iteration as productive"
                 echo '{"status": "timed_out_productive", "files_changed": '$timeout_files_changed', "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
 
-                record_loop_cost "$selected_model" "$loop_duration_s" "true" "0" "TIMEOUT"
-                log_status "INFO" "Timeout cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+                record_loop_cost "$selected_model" "$loop_duration_s" "true" "0" "TIMEOUT" "$CURRENT_SPEED_TIER"
+                log_status "INFO" "Timeout cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
                 record_improvement_note "$loop_count" "$current_phase" "$selected_model" "0" "$loop_duration_s" \
-                    "$(estimate_cost "$selected_model" "$loop_duration_s")" "true" "$timeout_files_changed" "$output_file"
+                    "$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER")" "true" "$timeout_files_changed" "$output_file" "$CURRENT_SPEED_TIER"
 
                 # Save session ID (fallback already populated by Step 1 if stream was truncated)
                 if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
@@ -1912,10 +1931,10 @@ EOF
                 return 0
             else
                 # Idle timeout — no work detected
-                record_loop_cost "$selected_model" "$loop_duration_s" "false" "0" "TIMEOUT"
-                log_status "INFO" "Timeout cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+                record_loop_cost "$selected_model" "$loop_duration_s" "false" "0" "TIMEOUT" "$CURRENT_SPEED_TIER"
+                log_status "INFO" "Timeout cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
                 record_improvement_note "$loop_count" "$current_phase" "$selected_model" "0" "$loop_duration_s" \
-                    "$(estimate_cost "$selected_model" "$loop_duration_s")" "false" "0" "$output_file"
+                    "$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER")" "false" "0" "$output_file" "$CURRENT_SPEED_TIER"
                 log_status "WARN" "⏱️ Timeout with no detectable progress"
                 return 1
             fi
@@ -1956,13 +1975,13 @@ EOF
             4) _error_code="BUDGET_EXCEEDED" ;;
             *) _error_code="UNKNOWN" ;;
         esac
-        record_loop_cost "$selected_model" "$loop_duration_s" "false" "0" "$_error_code"
-        log_status "INFO" "Failure cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
+        record_loop_cost "$selected_model" "$loop_duration_s" "false" "0" "$_error_code" "$CURRENT_SPEED_TIER"
+        log_status "INFO" "Failure cost: ~\$$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER") | Session: \$$(get_session_spend)/\$$RALPH_SESSION_BUDGET"
         local current_phase
         current_phase=$(grep 'CURRENT_PHASE=' .ralphrc 2>/dev/null | head -1 | sed 's/.*CURRENT_PHASE=//;s/"//g;s/#.*//' | tr -d '[:space:]')
         current_phase=${current_phase:-unknown}
         record_improvement_note "$loop_count" "$current_phase" "$selected_model" "0" "$loop_duration_s" \
-            "$(estimate_cost "$selected_model" "$loop_duration_s")" "false" "0" "$output_file"
+            "$(estimate_cost "$selected_model" "$loop_duration_s" "$CURRENT_SPEED_TIER")" "false" "0" "$output_file" "$CURRENT_SPEED_TIER"
         log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
         return 1
     fi

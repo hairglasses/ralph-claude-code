@@ -105,7 +105,7 @@ extract_retrospective() {
 }
 
 # Record an improvement note after a successful loop
-# Usage: record_improvement_note loop_count phase model tasks_done duration_s cost_usd productive files_changed output_file
+# Usage: record_improvement_note loop_count phase model tasks_done duration_s cost_usd productive files_changed output_file [speed_tier]
 record_improvement_note() {
     local loop_count=$1
     local phase=$2
@@ -116,6 +116,7 @@ record_improvement_note() {
     local productive=$7
     local files_changed=$8
     local output_file=$9
+    local speed_tier=${10:-standard}
 
     init_improvement_journal
 
@@ -138,6 +139,7 @@ record_improvement_note() {
         --argjson loop "$loop_count" \
         --arg phase "$phase" \
         --arg model "$model" \
+        --arg speed_tier "$speed_tier" \
         --argjson tasks_done "$tasks_done" \
         --argjson duration_s "$duration_s" \
         --argjson cost_usd "$cost_usd" \
@@ -146,7 +148,7 @@ record_improvement_note() {
         --arg worked "$worked" \
         --arg didnt "$didnt" \
         --arg suggest "$suggest" \
-        '{ts: $ts, loop: $loop, phase: $phase, model: $model, tasks_done: $tasks_done, duration_s: $duration_s, cost_usd: $cost_usd, productive: $productive, files_changed: $files_changed, worked: $worked, didnt: $didnt, suggest: $suggest}')
+        '{ts: $ts, loop: $loop, phase: $phase, model: $model, speed_tier: $speed_tier, tasks_done: $tasks_done, duration_s: $duration_s, cost_usd: $cost_usd, productive: $productive, files_changed: $files_changed, worked: $worked, didnt: $didnt, suggest: $suggest}')
 
     echo "$entry" >> "$IMPROVEMENT_JOURNAL_FILE"
 }

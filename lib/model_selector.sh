@@ -134,6 +134,84 @@ increment_opus_window() {
         '{window_start: $ws, count: $c}' > "$OPUS_WINDOW_FILE"
 }
 
+# Phase patterns that benefit from deep thinking (standard mode)
+ANALYSIS_PHASE_PATTERNS=(
+    "analyz"
+    "architect"
+    "debug"
+    "refactor"
+    "design"
+    "plan"
+    "investig"
+    "review"
+    "audit"
+    "security"
+    "diagnos"
+)
+
+# Phase patterns that benefit from speed (fast mode)
+EXECUTION_PHASE_PATTERNS=(
+    "implement"
+    "add.*tool"
+    "create.*module"
+    "expand.*test"
+    "write.*test"
+    "fix.*typo"
+    "update.*docs"
+    "mechanical"
+    "migrate"
+    "rename"
+    "format"
+    "sweep"
+)
+
+# Speed tier selection based on phase and task context
+# Returns "fast" or "standard"
+select_speed_tier() {
+    local fast_enabled=${FAST_MODE_ENABLED:-false}
+    if [[ "$fast_enabled" != "true" ]]; then
+        echo "standard"
+        return 0
+    fi
+
+    # Check current phase from .ralphrc
+    local current_phase
+    current_phase=$(grep 'CURRENT_PHASE=' .ralphrc 2>/dev/null | head -1 | sed 's/.*CURRENT_PHASE=//;s/"//g;s/#.*//' | tr -d '[:space:]')
+
+    # Check next task from fix_plan.md
+    local next_task
+    next_task=$(grep -m1 -E "^[[:space:]]*- \[ \]" "$RALPH_DIR/fix_plan.md" 2>/dev/null || true)
+
+    local combined="$current_phase $next_task"
+
+    # Check execution patterns first (fast mode)
+    local pattern
+    for pattern in "${EXECUTION_PHASE_PATTERNS[@]}"; do
+        if echo "$combined" | grep -qiE "$pattern"; then
+            echo "fast"
+            return 0
+        fi
+    done
+
+    # Check analysis patterns (standard mode)
+    for pattern in "${ANALYSIS_PHASE_PATTERNS[@]}"; do
+        if echo "$combined" | grep -qiE "$pattern"; then
+            echo "standard"
+            return 0
+        fi
+    done
+
+    # Default when phase is unknown
+    if [[ "${FAST_MODE_DEFAULT:-false}" == "true" ]]; then
+        echo "fast"
+    else
+        echo "standard"
+    fi
+}
+
+# Global speed tier — set by select_model(), read by build_claude_command()
+CURRENT_SPEED_TIER="standard"
+
 # Main model selection function
 # Usage: select_model [loop_count]
 # Prints "opus" or "sonnet" to stdout
@@ -146,6 +224,9 @@ select_model() {
     if is_simple_task; then
         echo "sonnet"
         echo "sonnet" > "$CURRENT_MODEL_FILE"
+        # Simple tasks benefit from speed — always fast
+        CURRENT_SPEED_TIER="fast"
+        echo "$CURRENT_SPEED_TIER" > "$RALPH_DIR/.current_speed_tier"
         return 0
     fi
 
@@ -162,6 +243,8 @@ select_model() {
         if [[ "$budget_status" == "downgrade" ]]; then
             echo "sonnet"
             echo "sonnet" > "$CURRENT_MODEL_FILE"
+            CURRENT_SPEED_TIER=$(select_speed_tier)
+            echo "$CURRENT_SPEED_TIER" > "$RALPH_DIR/.current_speed_tier"
             return 0
         fi
     fi
@@ -171,6 +254,8 @@ select_model() {
         if ! check_opus_window; then
             echo "sonnet"
             echo "sonnet" > "$CURRENT_MODEL_FILE"
+            CURRENT_SPEED_TIER=$(select_speed_tier)
+            echo "$CURRENT_SPEED_TIER" > "$RALPH_DIR/.current_speed_tier"
             return 0
         fi
     fi
@@ -181,6 +266,10 @@ select_model() {
 
     # NOTE: opus window increment moved to success path in ralph_loop.sh
     # so that timeouts don't consume window slots
+
+    # Determine speed tier (orthogonal to model selection)
+    CURRENT_SPEED_TIER=$(select_speed_tier)
+    echo "$CURRENT_SPEED_TIER" > "$RALPH_DIR/.current_speed_tier"
 
     return 0
 }
@@ -198,5 +287,6 @@ get_current_model() {
 export -f is_simple_task
 export -f check_opus_window
 export -f increment_opus_window
+export -f select_speed_tier
 export -f select_model
 export -f get_current_model

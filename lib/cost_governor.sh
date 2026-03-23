@@ -18,8 +18,16 @@ COST_SUMMARY_FILE="$RALPH_DIR/cost_summary.json"
 # opus: ~$4.50/min (input ~150K tok/min @ $15/M + output ~4K tok/min @ $75/M ≈ $2.55+$0.30 + overhead)
 # sonnet: ~$0.30/min (input ~150K tok/min @ $3/M + output ~4K tok/min @ $15/M)
 _cost_per_minute() {
-    case "$1" in
-        opus)   echo "4.50" ;;
+    local model=$1
+    local speed_tier=${2:-standard}
+    case "$model" in
+        opus)
+            if [[ "$speed_tier" == "fast" ]]; then
+                echo "6.75"  # ~1.5x standard due to faster throughput at same token price
+            else
+                echo "4.50"
+            fi
+            ;;
         sonnet) echo "0.30" ;;
         *)      echo "4.50" ;;
     esac
@@ -48,32 +56,34 @@ EOF
 }
 
 # Estimate cost for a model and duration
-# Usage: estimate_cost "opus" 900
+# Usage: estimate_cost "opus" 900 ["fast"|"standard"]
 # Returns: cost in USD (e.g., "9.00")
 estimate_cost() {
     local model=$1
     local duration_secs=$2
+    local speed_tier=${3:-standard}
 
     local rate
-    rate=$(_cost_per_minute "$model")
+    rate=$(_cost_per_minute "$model" "$speed_tier")
     local minutes
     minutes=$(awk "BEGIN {printf \"%.2f\", $duration_secs / 60}")
     awk "BEGIN {printf \"%.2f\", $minutes * $rate}"
 }
 
 # Record cost for a completed loop
-# Usage: record_loop_cost "opus" 900 true 3 "SUCCESS"
+# Usage: record_loop_cost "opus" 900 true 3 "SUCCESS" ["fast"|"standard"]
 record_loop_cost() {
     local model=$1
     local duration_secs=$2
     local productive=$3
     local tasks_done=${4:-0}
     local error_code=${5:-"UNKNOWN"}
+    local speed_tier=${6:-standard}
 
     init_cost_tracking
 
     local cost
-    cost=$(estimate_cost "$model" "$duration_secs")
+    cost=$(estimate_cost "$model" "$duration_secs" "$speed_tier")
     local ts
     ts=$(get_iso_timestamp)
 
@@ -90,12 +100,13 @@ record_loop_cost() {
         --arg ts "$ts" \
         --argjson loop "$loop_count" \
         --arg model "$model" \
+        --arg speed_tier "$speed_tier" \
         --argjson duration_s "$duration_secs" \
         --argjson cost_usd "$cost" \
         --argjson productive "$productive" \
         --argjson tasks_done "$tasks_done" \
         --arg error_code "$error_code" \
-        '{ts: $ts, loop: $loop, model: $model, duration_s: $duration_s, cost_usd: $cost_usd, productive: $productive, tasks_done: $tasks_done, error_code: $error_code}')
+        '{ts: $ts, loop: $loop, model: $model, speed_tier: $speed_tier, duration_s: $duration_s, cost_usd: $cost_usd, productive: $productive, tasks_done: $tasks_done, error_code: $error_code}')
     echo "$entry" >> "$COST_LEDGER_FILE"
 
     # Update summary
